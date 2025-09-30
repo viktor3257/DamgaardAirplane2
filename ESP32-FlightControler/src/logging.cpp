@@ -5,6 +5,13 @@
 namespace {
   bool logging_enabled = false;
 
+  static void tpValue(const char *name, double value) {
+    Serial.print('>');
+    Serial.print(name);
+    Serial.print(':');
+    Serial.println(value);
+  }
+
   bool cond_logging_enabled() {
     while (Serial.available() > 0) {
       const int ch = Serial.read();
@@ -16,11 +23,8 @@ namespace {
   }
 
   void job_teleplot_globals() {
-    Serial.print(">tp:g_counter1:");
-    Serial.println(g_counter1);
-
-    Serial.print(">tp:g_counter2:");
-    Serial.println(g_counter2);
+    tpValue("tp:g_counter1", g_counter1);
+    tpValue("tp:g_counter2", g_counter2);
   }
 }
 
