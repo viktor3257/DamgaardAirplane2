@@ -3,11 +3,17 @@
 #include <Arduino.h>
 #include <FS.h>
 #include <LittleFS.h>
+#include <cstring>
+#include <cstdio>
 
 namespace {
-  constexpr size_t HISTORY_CAP = 64;        // ~12 seconds at 5 Hz
-  constexpr size_t PERSIST_QUEUE_CAP = 32;  // ~6 seconds at 5 Hz
-  const char* const LOG_FILE_PATH = "/global_history.csv";
+  constexpr size_t   HISTORY_CAP = 64;        // ~12 seconds at 5 Hz
+  constexpr size_t   PERSIST_QUEUE_CAP = 32;  // ~6 seconds at 5 Hz
+  constexpr uint32_t ROTATION_INTERVAL_MS = 120000;  // 2 minutes
+  constexpr size_t   HISTORY_FILES_TO_KEEP = 5;       // ~10 minutes of history
+  constexpr size_t   MAX_DISCOVERED_FILES = 32;
+  const char* const  LOG_FILE_PREFIX = "/global_history_";
+  const char* const  LOG_FILE_SUFFIX = ".csv";
 
   struct LogEntry {
     uint32_t timestamp_ms;
@@ -27,6 +33,12 @@ namespace {
   bool     logging_enabled = false;
   bool     dump_requested = false;
   bool     fs_ready = false;
+  bool     log_files_initialized = false;
+
+  uint32_t current_file_index = 0;
+  uint32_t current_file_start_ms = 0;
+  bool     current_file_ready = false;
+  char     current_file_path[32] = {0};
 
   void ensure_filesystem() {
     if (!fs_ready) {
@@ -70,12 +82,210 @@ namespace {
     }
   }
 
+  String build_log_file_path(uint32_t index) {
+    char buffer[32];
+    snprintf(buffer,
+             sizeof(buffer),
+             "%s%06lu%s",
+             LOG_FILE_PREFIX,
+             static_cast<unsigned long>(index),
+             LOG_FILE_SUFFIX);
+    return String(buffer);
+  }
+
+  bool parse_log_file_index(const char* name, uint32_t& index_out) {
+    const size_t prefix_len = strlen(LOG_FILE_PREFIX);
+    const size_t suffix_len = strlen(LOG_FILE_SUFFIX);
+    const size_t name_len = strlen(name);
+
+    if (name_len <= prefix_len + suffix_len) {
+      return false;
+    }
+    if (strncmp(name, LOG_FILE_PREFIX, prefix_len) != 0) {
+      return false;
+    }
+    if (strncmp(name + name_len - suffix_len, LOG_FILE_SUFFIX, suffix_len) != 0) {
+      return false;
+    }
+
+    const size_t digits_len = name_len - prefix_len - suffix_len;
+    uint32_t     value = 0;
+    for (size_t i = 0; i < digits_len; ++i) {
+      const char ch = name[prefix_len + i];
+      if (ch < '0' || ch > '9') {
+        return false;
+      }
+      value = value * 10 + static_cast<uint32_t>(ch - '0');
+    }
+
+    index_out = value;
+    return true;
+  }
+
+  void set_current_file(uint32_t index) {
+    current_file_index = index;
+    String path = build_log_file_path(index);
+    strncpy(current_file_path, path.c_str(), sizeof(current_file_path));
+    current_file_path[sizeof(current_file_path) - 1] = '\0';
+    current_file_start_ms = millis();
+    current_file_ready = true;
+  }
+
+  void enforce_retention() {
+    if (!fs_ready) {
+      return;
+    }
+
+    File root = LittleFS.open("/", FILE_READ);
+    if (!root) {
+      Serial.println(F("[logging] Failed to open filesystem root for retention"));
+      return;
+    }
+
+    uint32_t indexes[MAX_DISCOVERED_FILES];
+    size_t   count = 0;
+
+    while (true) {
+      File entry = root.openNextFile();
+      if (!entry) {
+        break;
+      }
+
+      uint32_t idx = 0;
+      if (parse_log_file_index(entry.name(), idx)) {
+        if (count < MAX_DISCOVERED_FILES) {
+          indexes[count++] = idx;
+        }
+      }
+      entry.close();
+    }
+    root.close();
+
+    if (count <= HISTORY_FILES_TO_KEEP) {
+      return;
+    }
+
+    // Simple selection sort to arrange indexes in ascending order.
+    for (size_t i = 0; i + 1 < count; ++i) {
+      size_t min_idx = i;
+      for (size_t j = i + 1; j < count; ++j) {
+        if (indexes[j] < indexes[min_idx]) {
+          min_idx = j;
+        }
+      }
+      if (min_idx != i) {
+        uint32_t tmp = indexes[i];
+        indexes[i] = indexes[min_idx];
+        indexes[min_idx] = tmp;
+      }
+    }
+
+    const size_t to_delete = count - HISTORY_FILES_TO_KEEP;
+    for (size_t i = 0; i < to_delete; ++i) {
+      String path = build_log_file_path(indexes[i]);
+      if (!LittleFS.remove(path.c_str())) {
+        Serial.print(F("[logging] Failed to remove old log file: "));
+        Serial.println(path);
+      }
+    }
+  }
+
+  void rotate_log_file() {
+    uint32_t next_index = current_file_ready ? (current_file_index + 1) : 0;
+    set_current_file(next_index);
+
+    File f = LittleFS.open(current_file_path, FILE_WRITE);
+    if (!f) {
+      Serial.println(F("[logging] Failed to create rotated log file"));
+      current_file_ready = false;
+      return;
+    }
+    write_header_if_empty(f);
+    f.close();
+    enforce_retention();
+  }
+
+  void initialize_log_files() {
+    if (log_files_initialized || !fs_ready) {
+      return;
+    }
+
+    File root = LittleFS.open("/", FILE_READ);
+    if (!root) {
+      Serial.println(F("[logging] Failed to scan filesystem for logs"));
+      return;
+    }
+
+    bool     found_any = false;
+    uint32_t max_index = 0;
+
+    while (true) {
+      File entry = root.openNextFile();
+      if (!entry) {
+        break;
+      }
+
+      uint32_t idx = 0;
+      if (parse_log_file_index(entry.name(), idx)) {
+        if (!found_any || idx > max_index) {
+          max_index = idx;
+          found_any = true;
+        }
+      }
+      entry.close();
+    }
+    root.close();
+
+    if (found_any) {
+      set_current_file(max_index);
+      File f = LittleFS.open(current_file_path, FILE_APPEND);
+      if (f) {
+        write_header_if_empty(f);
+        f.close();
+      } else {
+        Serial.println(F("[logging] Failed to open existing log file"));
+        current_file_ready = false;
+      }
+    } else {
+      rotate_log_file();
+    }
+
+    log_files_initialized = current_file_ready;
+  }
+
+  void ensure_log_file() {
+    if (!fs_ready) {
+      return;
+    }
+
+    if (!log_files_initialized) {
+      initialize_log_files();
+    }
+
+    if (!current_file_ready) {
+      rotate_log_file();
+      log_files_initialized = current_file_ready;
+    }
+  }
+
   void flush_pending_to_fs() {
     if (persist_size == 0) return;
     ensure_filesystem();
     if (!fs_ready) return;
 
-    File f = LittleFS.open(LOG_FILE_PATH, FILE_APPEND);
+    ensure_log_file();
+    if (!current_file_ready) {
+      return;
+    }
+
+    if (millis() - current_file_start_ms >= ROTATION_INTERVAL_MS) {
+      rotate_log_file();
+      if (!current_file_ready) {
+        return;
+      }
+    }
+
+    File f = LittleFS.open(current_file_path, FILE_APPEND);
     if (!f) {
       Serial.println(F("[logging] Failed to open history file"));
       return;
@@ -120,12 +330,35 @@ namespace {
       return;
     }
 
-    if (!LittleFS.exists(LOG_FILE_PATH)) {
+    File root = LittleFS.open("/", FILE_READ);
+    if (!root) {
+      Serial.println(F("[logging] Failed to open filesystem root for clear"));
       return;
     }
 
-    if (!LittleFS.remove(LOG_FILE_PATH)) {
-      Serial.println(F("[logging] Failed to clear history file"));
+    bool any_failure = false;
+    while (true) {
+      File entry = root.openNextFile();
+      if (!entry) {
+        break;
+      }
+
+      uint32_t idx = 0;
+      if (parse_log_file_index(entry.name(), idx)) {
+        String path = build_log_file_path(idx);
+        if (!LittleFS.remove(path.c_str())) {
+          Serial.print(F("[logging] Failed to remove log file during clear: "));
+          Serial.println(path);
+          any_failure = true;
+        }
+      }
+      entry.close();
+    }
+    root.close();
+
+    if (!any_failure) {
+      current_file_ready = false;
+      log_files_initialized = false;
     }
   }
 
@@ -136,31 +369,75 @@ namespace {
       return false;
     }
 
-    if (!LittleFS.exists(LOG_FILE_PATH)) {
+    File root = LittleFS.open("/", FILE_READ);
+    if (!root) {
+      Serial.println(F("[logging] Failed to open filesystem root for dump"));
+      return false;
+    }
+
+    uint32_t indexes[MAX_DISCOVERED_FILES];
+    size_t   count = 0;
+
+    while (true) {
+      File entry = root.openNextFile();
+      if (!entry) {
+        break;
+      }
+
+      uint32_t idx = 0;
+      if (parse_log_file_index(entry.name(), idx)) {
+        if (count < MAX_DISCOVERED_FILES) {
+          indexes[count++] = idx;
+        }
+      }
+      entry.close();
+    }
+    root.close();
+
+    if (count == 0) {
       Serial.println(F("[logging] No persisted history yet"));
       return false;
     }
 
-    File f = LittleFS.open(LOG_FILE_PATH, FILE_READ);
-    if (!f) {
-      Serial.println(F("[logging] Failed to read history file"));
-      return false;
+    for (size_t i = 0; i + 1 < count; ++i) {
+      size_t min_idx = i;
+      for (size_t j = i + 1; j < count; ++j) {
+        if (indexes[j] < indexes[min_idx]) {
+          min_idx = j;
+        }
+      }
+      if (min_idx != i) {
+        uint32_t tmp = indexes[i];
+        indexes[i] = indexes[min_idx];
+        indexes[min_idx] = tmp;
+      }
     }
 
-    bool header_skipped = false;
     bool data_written = false;
-    while (f.available()) {
-      int c = f.read();
-      if (!header_skipped) {
-        if (c == '\n') {
-          header_skipped = true;
-        }
+    for (size_t i = 0; i < count; ++i) {
+      String path = build_log_file_path(indexes[i]);
+      File   f = LittleFS.open(path.c_str(), FILE_READ);
+      if (!f) {
+        Serial.print(F("[logging] Failed to read log file: "));
+        Serial.println(path);
         continue;
       }
-      Serial.write(c);
-      data_written = true;
+
+      bool header_skipped = false;
+      while (f.available()) {
+        int c = f.read();
+        if (!header_skipped) {
+          if (c == '\n') {
+            header_skipped = true;
+          }
+          continue;
+        }
+        Serial.write(c);
+        data_written = true;
+      }
+      f.close();
     }
-    f.close();
+
     return data_written;
   }
 
