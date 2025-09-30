@@ -106,8 +106,8 @@ namespace {
   }
 
   void job_teleplot_globals() {
-    tpValue("tp:g_counter1", g_counter1);
-    tpValue("tp:g_counter2", g_counter2);
+    tpValue("g_counter1", g_counter1);
+    tpValue("g_counter2", g_counter2);
   }
 
   bool cond_persist_needed() {
