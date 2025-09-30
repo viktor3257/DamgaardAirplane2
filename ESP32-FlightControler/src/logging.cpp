@@ -114,47 +114,54 @@ namespace {
     return persist_size > 0;
   }
 
-  void dump_persistent_history() {
+  void clear_persistent_history() {
     ensure_filesystem();
     if (!fs_ready) {
-      Serial.println(F("[logging] LittleFS unavailable"));
       return;
     }
 
     if (!LittleFS.exists(LOG_FILE_PATH)) {
-      Serial.println(F("[logging] No persisted history yet"));
       return;
+    }
+
+    if (!LittleFS.remove(LOG_FILE_PATH)) {
+      Serial.println(F("[logging] Failed to clear history file"));
+    }
+  }
+
+  bool dump_persistent_history() {
+    ensure_filesystem();
+    if (!fs_ready) {
+      Serial.println(F("[logging] LittleFS unavailable"));
+      return false;
+    }
+
+    if (!LittleFS.exists(LOG_FILE_PATH)) {
+      Serial.println(F("[logging] No persisted history yet"));
+      return false;
     }
 
     File f = LittleFS.open(LOG_FILE_PATH, FILE_READ);
     if (!f) {
       Serial.println(F("[logging] Failed to read history file"));
-      return;
+      return false;
     }
 
-    Serial.println(F("[logging] --- Persisted history ---"));
+    bool header_skipped = false;
+    bool data_written = false;
     while (f.available()) {
-      Serial.write(f.read());
+      int c = f.read();
+      if (!header_skipped) {
+        if (c == '\n') {
+          header_skipped = true;
+        }
+        continue;
+      }
+      Serial.write(c);
+      data_written = true;
     }
     f.close();
-  }
-
-  void dump_ram_history() {
-    Serial.println(F("[logging] --- Recent RAM history ---"));
-    if (history_size == 0) {
-      Serial.println(F("[logging] (empty)"));
-      return;
-    }
-
-    const size_t start = (history_head + HISTORY_CAP - history_size) % HISTORY_CAP;
-    for (size_t i = 0; i < history_size; ++i) {
-      const size_t idx = (start + i) % HISTORY_CAP;
-      const LogEntry& e = history_buffer[idx];
-      Serial.printf("%lu,%lu,%lu\n",
-                    static_cast<unsigned long>(e.timestamp_ms),
-                    static_cast<unsigned long>(e.counter1),
-                    static_cast<unsigned long>(e.counter2));
-    }
+    return data_written;
   }
 
   bool cond_dump_requested() {
@@ -175,9 +182,9 @@ namespace {
   void job_dump_history() {
     dump_requested = false;
     flush_pending_to_fs();
-    dump_persistent_history();
-    dump_ram_history();
-    Serial.println(F("[logging] --- End of history ---"));
+    if (dump_persistent_history()) {
+      clear_persistent_history();
+    }
   }
 }
 
