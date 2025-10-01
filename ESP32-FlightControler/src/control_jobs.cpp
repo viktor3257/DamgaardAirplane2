@@ -12,15 +12,6 @@ static void job_increment_every_100ms() {
 
 // ----- Registration -----
 void register_control_jobs(JobRegistry& R) {
-  Job every100 = {
-    "ctrl_every_100ms",
-    JOB_TIMER,
-    /*interval_ms=*/100,
-    /*last_run_ms=*/0, // registry will set it to now
-    /*enabled=*/true,
-    /*ready=*/false,
-    /*condition=*/cond_always_true,
-    /*fn=*/job_increment_every_100ms
-  };
-  R.add(every100);
+  /*Job                       Job type    Interval    last_run_ms   enabled   ready   condition             fn*/
+  R.add({"ctrl_every_100ms",  JOB_TIMER,  100,        0,            true,     false,  cond_always_true,     job_increment_every_100ms});
 }
