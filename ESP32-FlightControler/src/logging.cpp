@@ -29,6 +29,6 @@ namespace {
 }
 
 void register_logging(JobRegistry& R) {
-    /*Job                       Job type    Interval    last_run_ms   enabled   ready   condition               fn*/
+    /*Job                              Job type    Interval    last_run_ms   enabled   ready   condition               fn*/
     R.add({"logging_teleplot_globals", JOB_TIMER,  100,        0,            true,     false,  cond_logging_enabled,   job_teleplot_globals});
 }

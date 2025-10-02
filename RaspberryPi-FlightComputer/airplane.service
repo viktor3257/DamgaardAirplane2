@@ -1,0 +1,21 @@
+
+# /etc/systemd/system/airplane.service
+[Unit]
+Description=Damgaard Airplane Pi process
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust WorkingDirectory to where your repo lives:
+WorkingDirectory=/home/pi/Damgaard-Airplane
+ExecStart=/usr/bin/env python3 /home/pi/Damgaard-Airplane/airplane_pi.py
+Restart=always
+RestartSec=3
+Environment=AIRPLANE_DEBUG=1
+# Add other env like API base or keys:
+# Environment=AIRPLANE_API_BASE=https://your-domain.tld
+# Environment=AIRPLANE_YT_KEY=rtmps://a.rtmp.youtube.com/live2/xxxx-xxxx-xxxx-xxxx
+
+[Install]
+WantedBy=multi-user.target
