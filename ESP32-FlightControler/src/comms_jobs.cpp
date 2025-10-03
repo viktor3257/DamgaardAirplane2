@@ -18,10 +18,9 @@ static void job_increment_on_c1x10() {
   g_counter2 += 1;
 }
 
-static bool cond_always_on() {
-  return true;
-}
+static bool cond_always_on() { return true; }
 
+// Lazy-inited UART (adjust pins: begin(baud, config, RX, TX))
 static HardwareSerial& pi_uart() {
   static bool initialized = false;
   static HardwareSerial& serial = Serial2;
@@ -32,28 +31,20 @@ static HardwareSerial& pi_uart() {
   return serial;
 }
 
-struct TelemetryItem {
-  const uint8_t* data;
-  size_t size;
-};
-
-static void job_uart_send_globals() {
-  const TelemetryItem items[] = {
-      {reinterpret_cast<const uint8_t*>(&g_counter1), sizeof(g_counter1)},
-      {reinterpret_cast<const uint8_t*>(&g_counter2), sizeof(g_counter2)},
-  };
-
-  HardwareSerial& serial = pi_uart();
-  const uint8_t start_indicator = 0xAA;
-  serial.write(start_indicator);
-
-  for (const TelemetryItem& item : items) {
-    serial.write(item.data, item.size);
+// ---- Minimal CSV: "g_counter1,g_counter2\n" (no snapshots) ----
+static void job_uart_send_globals_csv() {
+  char line[48];
+  // Use the volatile globals directly in the format string
+  const int n = snprintf(line, sizeof(line), "%lu,%lu\n",
+                         (unsigned long)g_counter1,
+                         (unsigned long)g_counter2);
+  if (n > 0) {
+    pi_uart().print(line);
   }
 }
 
 void register_comms_jobs(JobRegistry& R) {
-  /*Job                     Job type   Interval  last_run_ms  enabled  ready  condition                         fn*/
-  R.add({"comms_on_c1_x10", JOB_EVENT, 0,        0,           true,    false, cond_counter1_multiple_of_10_once, job_increment_on_c1x10});
-  R.add({"comms_uart_globals", JOB_TIMER, 200,      0,           true,    false, cond_always_on,                   job_uart_send_globals});
+  /*Job                         Job type  Interval  last_run_ms  enabled  ready  condition                          fn*/
+  R.add({"comms_on_c1_x10",     JOB_EVENT, 0,        0,           true,    false, cond_counter1_multiple_of_10_once, job_increment_on_c1x10});
+  R.add({"comms_uart_globals",  JOB_TIMER,  200,     0,           true,    false, cond_always_on,                    job_uart_send_globals_csv});
 }
