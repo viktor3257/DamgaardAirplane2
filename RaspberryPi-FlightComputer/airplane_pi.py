@@ -27,6 +27,7 @@ import random
 import asyncio
 import logging
 import subprocess
+import aiohttp
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -88,6 +89,8 @@ class Telemetry:
     lat: float = math.nan
     lon: float = math.nan
     alt_m: float = math.nan
+    mode: int = 1               # 1=Neutral, 2=Manual, 3=Circling (from ESP32)
+    battery_pct: float = math.nan  # 0..100 (from ESP32)
 
 @dataclass
 class RuntimeState:
@@ -116,11 +119,12 @@ async def gps_reader(state: RuntimeState, cfg: Config, logger: logging.Logger):
         )
 
 async def esp32_uart_rx(state: RuntimeState, cfg: Config, logger: logging.Logger):
-    """Simulate telemetry from ESP32 at ~20 Hz."""
     t0 = time.time()
     while not state.shutting_down:
         await asyncio.sleep(0.05)
         t = time.time() - t0
+        mode_sim = [1, 2, 3][int(t // 10) % 3]     # cycles every 10s
+        pct_sim  = 80 + 15*math.sin(t/30)          # ~65..95% just for demo
         state.latest_esp32 = Telemetry(
             time_utc=time.time(),
             batt_v=11.1 + 0.2 * math.sin(t / 10),
@@ -132,7 +136,10 @@ async def esp32_uart_rx(state: RuntimeState, cfg: Config, logger: logging.Logger
             lat=state.latest_gps.lat,
             lon=state.latest_gps.lon,
             alt_m=state.latest_gps.alt_m,
+            mode=mode_sim,
+            battery_pct=max(0, min(100, pct_sim)),
         )
+
 
 async def esp32_uart_tx(uart_tx_q: asyncio.Queue, state: RuntimeState, cfg: Config, logger: logging.Logger):
     """Simulate sending commands to ESP32 by printing them."""
@@ -267,27 +274,39 @@ async def file_logger(state: RuntimeState, cfg: Config, logger: logging.Logger):
 
 
 async def web_poster(state: RuntimeState, cfg: Config, logger: logging.Logger):
-    """Simulate posting a JSON payload once per second."""
+    import aiohttp
+    url = "https://studio--sky-pointer.us-central1.hosted.app/api/drone-location"
     period = 1.0 / max(cfg.post_rate_hz, 1.0)
-    while not state.shutting_down:
-        await asyncio.sleep(period)
-        te = state.latest_esp32
-        gp = state.latest_gps
-        # Inline ISO timestamp (no shared helpers)
-        ts = datetime.fromtimestamp(time.time(), tz=timezone.utc).isoformat()
-        payload = {
-            "ts": ts,
-            "battery_v": round(te.batt_v, 3) if math.isfinite(te.batt_v) else None,
-            "gps": {
-                "lat": round(gp.lat, 6) if math.isfinite(gp.lat) else None,
-                "lon": round(gp.lon, 6) if math.isfinite(gp.lon) else None,
-                "alt_m": round(gp.alt_m, 1) if math.isfinite(gp.alt_m) else None,
-                "sats": gp.sats,
-                "fix_ok": gp.fix_ok,
-            },
-            "stream": state.stream_enabled,
-        }
-        logger.info(f"[POST] {json.dumps(payload)}")
+    headers = {"Content-Type": "application/json"}
+
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+        while not state.shutting_down:
+            await asyncio.sleep(period)
+            te = state.latest_esp32
+            gp = state.latest_gps
+
+            mode_str = {1: "Neutral", 2: "Manual", 3: "Circling"}.get(int(te.mode) if isinstance(te.mode, (int, float)) else 1, "Neutral")
+
+            payload = {
+                "lat": float(f"{gp.lat:.6f}") if isinstance(gp.lat, (int,float)) and math.isfinite(gp.lat) else 0.0,
+                "lng": float(f"{gp.lon:.6f}") if isinstance(gp.lon, (int,float)) and math.isfinite(gp.lon) else 0.0,
+                "heading": float(f"{te.yaw_deg:.2f}") if isinstance(te.yaw_deg, (int,float)) and math.isfinite(te.yaw_deg) else 0.0,
+                "height": float(f"{gp.alt_m:.1f}") if isinstance(gp.alt_m, (int,float)) and math.isfinite(gp.alt_m) else 0.0,
+                "airspeed": float(f"{te.airspeed_ms:.2f}") if isinstance(te.airspeed_ms, (int,float)) and math.isfinite(te.airspeed_ms) else 0.0,
+                "batteryPercentage": int(te.battery_pct) if isinstance(te.battery_pct, (int,float)) and math.isfinite(te.battery_pct) else 0,
+                "mode": mode_str,
+            }
+
+            try:
+                r = await session.post(url, json=payload, headers=headers)
+                if r.status >= 400:
+                    logger.info(f"[POST] {r.status} {await r.text()[:200]}")
+                else:
+                    logger.debug(f"[POST] ok {payload}")
+            except Exception as e:
+                logger.info(f"[POST] failed: {e}")
+
+
 
 async def health_task(state: RuntimeState, cfg: Config, logger: logging.Logger):
     """Heartbeat every 5 seconds."""
