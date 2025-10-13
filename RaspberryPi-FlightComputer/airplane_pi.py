@@ -34,6 +34,7 @@ from typing import List, Optional
 # Configuration (baked-in)
 # ---------------------------
 BASE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = BASE_DIR.parent
 
 @dataclass
 class Config:
@@ -204,14 +205,19 @@ async def file_logger(state: RuntimeState, cfg: Config, logger: logging.Logger):
     # 1) Find and push the most recent previous log (best-effort)
     previous_logs = sorted(cfg.log_dir.glob("flight_*.csv"))
     prev_to_push = previous_logs[-1] if previous_logs else None
-    if prev_to_push and (BASE_DIR / ".git").exists():
-        try:
-            subprocess.run(["git", "add", str(prev_to_push)], check=False)
-            subprocess.run(["git", "commit", "-m", f"Flight log {prev_to_push.name}"], check=False)
-            subprocess.run(["git", "push", cfg.git_remote, "HEAD"], check=False)
-            logger.info(f"Pushed previous log: {prev_to_push.name}")
-        except Exception as e:
-            logger.warning(f"Git push failed: {e}")
+
+    if prev_to_push and (REPO_ROOT / ".git").exists():
+        # If logs are ignored by .gitignore, add "-f" after "add" to force-add.
+        cmds = [
+            ["git", "-C", str(REPO_ROOT), "add", str(prev_to_push)],
+            ["git", "-C", str(REPO_ROOT), "commit", "-m", f"Flight log {prev_to_push.name}"],
+            ["git", "-C", str(REPO_ROOT), "push", "origin", "HEAD"],
+        ]
+        for cmd in cmds:
+            subprocess.run(cmd, check=False)
+    else:
+        # Optional: one-line hint in logs
+        logger.info("No previous log to push or not a git repo.")
 
     # 2) Create a fresh log file for this boot
     current_path = cfg.log_dir / f"flight_{ts_name_utc()}.csv"
