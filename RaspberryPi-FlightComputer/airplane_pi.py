@@ -54,6 +54,16 @@ class Config:
     # Logging verbosity
     debug: bool = True
 
+     # Streaming
+    rtmp_url: str = "rtmp://a.rtmp.youtube.com/live2"
+    rtmp_key: str = "bq45-5jky-84s0-cy0y-e8uy"
+    cam_width: int = 1280
+    cam_height: int = 720
+    cam_fps: int = 30
+    cam_rotation_deg: int = 180   # 180 to flip image
+    cam_bitrate_kbps: int = 3500  # tune if needed
+
+
 
 # ---------------------------
 # Data models
@@ -292,18 +302,128 @@ async def website_poller(state: RuntimeState, uart_tx_q: asyncio.Queue, cfg: Con
 # Stream manager
 # ---------------------------
 async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logger):
-    """Log when the stream flag turns on/off."""
+    """
+    Start/stop YouTube stream based on state.stream_enabled.
+    Pipeline: libcamera-vid (H.264) -> ffmpeg -> RTMP.
+    If the process exits while enabled, it is restarted.
+    """
+    import subprocess, os, time
+
+    cam_cmd = [
+        "libcamera-vid",
+        "--inline",                      # put SPS/PPS in-stream (needed for RTMP)
+        "--codec", "h264",
+        "--profile", "high",
+        "--level", "4.1",
+        "--width", str(cfg.cam_width),
+        "--height", str(cfg.cam_height),
+        "--framerate", str(cfg.cam_fps),
+        "--rotation", str(cfg.cam_rotation_deg),
+        "--bitrate", str(cfg.cam_bitrate_kbps * 1000),
+        "--intra", str(cfg.cam_fps * 2), # ~2s keyframe interval
+        "-t", "0",                       # run forever
+        "-o", "-"                        # write to stdout
+    ]
+
+    # ffmpeg copies H.264 to FLV; no re-encode = low CPU
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-re",                   # pace input (safer for RTMP)
+        "-i", "pipe:0",          # read from stdin
+        "-c:v", "copy",          # copy H.264 from libcamera-vid
+        "-an",                   # no audio
+        "-f", "flv",
+        f"{cfg.rtmp_url}/{cfg.rtmp_key}",
+    ]
+
+    libcam_proc = None
+    ffmpeg_proc = None
     running = False
-    while not state.shutting_down:
-        await asyncio.sleep(0.2)
-        if state.stream_enabled and not running:
+
+    def start_pipeline():
+        nonlocal libcam_proc, ffmpeg_proc, running
+        if running:
+            return
+        try:
+            libcam_proc = subprocess.Popen(
+                cam_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0
+            )
+            ffmpeg_proc = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=libcam_proc.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
             running = True
-            logger.info("[STREAM] starting")
-        elif not state.stream_enabled and running:
+            logger.info("[STREAM] started")
+        except Exception as e:
+            logger.info(f"[STREAM] failed to start: {e}")
+            # cleanup partial
+            try:
+                if ffmpeg_proc and ffmpeg_proc.poll() is None:
+                    ffmpeg_proc.terminate()
+            except Exception:
+                pass
+            try:
+                if libcam_proc and libcam_proc.poll() is None:
+                    libcam_proc.terminate()
+            except Exception:
+                pass
+            libcam_proc = None
+            ffmpeg_proc = None
             running = False
-            logger.info("[STREAM] stopping")
-    if running:
-        logger.info("[STREAM] stopping (shutdown)")
+
+    def stop_pipeline():
+        nonlocal libcam_proc, ffmpeg_proc, running
+        if not running:
+            return
+        logger.info("[STREAM] stopping")
+        for p in (ffmpeg_proc, libcam_proc):
+            try:
+                if p and p.poll() is None:
+                    p.terminate()
+            except Exception:
+                pass
+        # give them a moment, then kill if needed
+        time.sleep(0.5)
+        for p in (ffmpeg_proc, libcam_proc):
+            try:
+                if p and p.poll() is None:
+                    p.kill()
+            except Exception:
+                pass
+        libcam_proc, ffmpeg_proc = None, None
+        running = False
+
+    try:
+        while not state.shutting_down:
+            await asyncio.sleep(0.25)
+
+            # Desired state -> running state
+            if state.stream_enabled and not running:
+                start_pipeline()
+            elif not state.stream_enabled and running:
+                stop_pipeline()
+
+            # If streaming, ensure processes are alive; restart if they died
+            if state.stream_enabled and running:
+                dead = False
+                try:
+                    if libcam_proc and libcam_proc.poll() is not None:
+                        dead = True
+                    if ffmpeg_proc and ffmpeg_proc.poll() is not None:
+                        dead = True
+                except Exception:
+                    dead = True
+                if dead:
+                    logger.info("[STREAM] pipeline died; restarting")
+                    stop_pipeline()
+                    start_pipeline()
+    finally:
+        stop_pipeline()
 
 # ---------------------------
 # CSV logger
