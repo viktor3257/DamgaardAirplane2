@@ -28,7 +28,7 @@ import asyncio
 import logging
 import subprocess
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Optional
 
@@ -184,58 +184,50 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
 
 async def file_logger(state: RuntimeState, cfg: Config, logger: logging.Logger):
     """
-    CSV logger (~log_rate_hz). On entry:
-      1) If there is a previous flight log, rename it to the current UTC time,
-         commit+push it from the repo root, and delete it locally on success.
-      2) Create a fresh per-boot log and write rows; skip until telemetry is valid enough.
+    Simple CSV logger.
+    - On entry: rename previous flight to local(UTC+2) time 'YYYY-mm-dd_HH-MM.csv',
+      git add/commit/push it, and delete it if push succeeds.
+    - Then create 'flight_YYYYmmdd_HHMM.csv' for this boot and append rows.
     """
-    # Ensure directory
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Push previous flight (best-effort), rename to *push time* like 2025-10-13_09-58-22Z.csv
-    previous_logs = sorted(cfg.log_dir.glob("flight_*.csv"))
-    prev = previous_logs[-1] if previous_logs else None
-    if prev and (REPO_ROOT / ".git").exists():
-        pushed_name = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%SZ.csv")
-        renamed = prev.with_name(pushed_name)
+    # ---- 1) Push previous flight (best-effort) ----
+    prevs = sorted(cfg.log_dir.glob("flight_*.csv"))
+    if prevs and (REPO_ROOT / ".git").exists():
+        # Use "local" name = UTC+2, no trailing 'Z'
+        local_now = datetime.utcnow() + timedelta(hours=2)
+        pushed_name = local_now.strftime("%Y-%m-%d_%H-%M") + ".csv"
+        prev = prevs[-1]
+        target = prev.with_name(pushed_name)
         try:
-            prev.rename(renamed)
-
-            # If logs might be ignored, force add with -f (keeps this robust in headless mode)
-            add_cmd    = ["git", "-C", str(REPO_ROOT), "add", "-f", str(renamed)]
-            commit_cmd = ["git", "-C", str(REPO_ROOT), "commit", "-m", f"Flight log {renamed.name}"]
-            push_cmd   = ["git", "-C", str(REPO_ROOT), "push", "origin", "HEAD"]
-
-            add_rc    = subprocess.run(add_cmd,    check=False).returncode
-            commit_rc = subprocess.run(commit_cmd, check=False).returncode
-            push_rc   = subprocess.run(push_cmd,   check=False).returncode
-
-            if push_rc == 0:
+            prev.rename(target)
+            # If logs are ignored by .gitignore, keep "-f" to force-add
+            subprocess.run(["git", "-C", str(REPO_ROOT), "add", "-f", str(target)], check=False)
+            subprocess.run(["git", "-C", str(REPO_ROOT), "commit", "-m", f"Flight log {target.name}"], check=False)
+            r = subprocess.run(["git", "-C", str(REPO_ROOT), "push", "origin", "HEAD"], check=False)
+            if r.returncode == 0:
                 try:
-                    renamed.unlink()
-                    logger.info(f"Pushed and removed previous log: {renamed.name}")
-                except Exception as e:
-                    logger.warning(f"Pushed but failed to remove {renamed.name}: {e}")
+                    target.unlink()
+                    logger.info(f"Pushed and removed previous log: {target.name}")
+                except Exception:
+                    logger.info(f"Pushed previous log (kept local copy): {target.name}")
             else:
-                logger.warning("Previous log push failed; keeping file on disk.")
+                logger.info("Previous log push failed; kept file on disk.")
         except Exception as e:
-            logger.warning(f"Could not rename/push previous log: {e}")
+            logger.info(f"Skip push/rename of previous log: {e}")
     else:
         logger.info("No previous log to push or not a git repo.")
 
-    # 2) Create a fresh log file for this boot
-    current_path = cfg.log_dir / f"flight_{datetime.utcnow().strftime('%Y%m%d_%H%M%SZ')}.csv"
+    # ---- 2) New log for this boot ----
+    local_now = datetime.utcnow() + timedelta(hours=2)
+    current_path = cfg.log_dir / f"flight_{local_now.strftime('%Y%m%d_%H%M')}.csv"
     f = current_path.open("w", newline="")
     writer = csv.writer(f)
     writer.writerow(["ts_iso","batt_v","airspeed_ms","groundspeed_ms",
                      "roll_deg","pitch_deg","yaw_deg","lat","lon","alt_m"])
     f.flush()
-    try:
-        os.fsync(f.fileno())
-    except Exception:
-        pass
 
-    # Update latest symlink (best-effort)
+    # latest symlink (optional, best-effort)
     latest = cfg.log_dir / "latest.csv"
     try:
         if latest.exists() or latest.is_symlink():
@@ -245,59 +237,34 @@ async def file_logger(state: RuntimeState, cfg: Config, logger: logging.Logger):
         pass
     logger.info(f"Logging to {current_path}")
 
-    # 3) Wait until telemetry is at least partially valid to avoid blank runs
-    t_wait0 = time.time()
-    while not state.shutting_down:
-        te = state.latest_esp32
-        if math.isfinite(te.time_utc) and math.isfinite(te.batt_v):
-            break
-        if time.time() - t_wait0 > 5.0:
-            break
-        await asyncio.sleep(0.05)
-
-    # 4) Write rows
+    # ---- 3) Append rows ----
     period = 1.0 / max(cfg.log_rate_hz, 1.0)
-    fsync_every = 25
-    rows = 0
 
-    # Local formatters (kept inside this function)
-    def ts_iso(ts_opt: Optional[float]) -> str:
-        dt = datetime.fromtimestamp(ts_opt if (ts_opt is not None and math.isfinite(ts_opt)) else time.time(),
-                                    tz=timezone.utc)
-        return dt.isoformat()
+    def ts_iso(ts_val: Optional[float]) -> str:
+        # Use provided ts if it looks valid; otherwise "now" (UTC, ISO8601)
+        base = datetime.fromtimestamp(ts_val, tz=timezone.utc) if (isinstance(ts_val, (int,float)) and math.isfinite(ts_val)) else datetime.now(tz=timezone.utc)
+        return base.isoformat()
 
-    def fmt_num(x: float, nd: int) -> str:
+    def fmt(x, nd):
         return "" if not isinstance(x, (int, float)) or not math.isfinite(x) else f"{x:.{nd}f}"
 
     try:
         while not state.shutting_down:
             t0 = time.perf_counter()
             te = state.latest_esp32
-
             writer.writerow([
                 ts_iso(te.time_utc),
-                fmt_num(te.batt_v, 3), fmt_num(te.airspeed_ms, 3), fmt_num(te.groundspeed_ms, 3),
-                fmt_num(te.roll_deg, 3), fmt_num(te.pitch_deg, 3), fmt_num(te.yaw_deg, 3),
-                fmt_num(te.lat, 6), fmt_num(te.lon, 6), fmt_num(te.alt_m, 2),
+                fmt(te.batt_v,3), fmt(te.airspeed_ms,3), fmt(te.groundspeed_ms,3),
+                fmt(te.roll_deg,3), fmt(te.pitch_deg,3), fmt(te.yaw_deg,3),
+                fmt(te.lat,6), fmt(te.lon,6), fmt(te.alt_m,2),
             ])
             f.flush()
-            rows += 1
-            if rows % fsync_every == 0:
-                try:
-                    os.fsync(f.fileno())
-                except Exception:
-                    pass
-
             dt = period - (time.perf_counter() - t0)
             if dt > 0:
                 await asyncio.sleep(dt)
     finally:
-        try:
-            f.flush()
-            os.fsync(f.fileno())
-        except Exception:
-            pass
         f.close()
+
 
 async def web_poster(state: RuntimeState, cfg: Config, logger: logging.Logger):
     """Simulate posting a JSON payload once per second."""
