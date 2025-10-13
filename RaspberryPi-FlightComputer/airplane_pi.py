@@ -152,28 +152,58 @@ async def esp32_uart_tx(uart_tx_q: asyncio.Queue, state: RuntimeState, cfg: Conf
         uart_tx_q.task_done()
 
 async def website_poller(state: RuntimeState, uart_tx_q: asyncio.Queue, cfg: Config, logger: logging.Logger):
-    """Simulate a website poll: toggle stream every ~15 s and update simple targets."""
-    last_toggle = time.time()
-    toggle_every = 15.0
-    k = 0
-    while not state.shutting_down:
-        await asyncio.sleep(cfg.poll_period_s)
-        now = time.time()
-        if now - last_toggle > toggle_every:
-            state.stream_enabled = not state.stream_enabled
-            last_toggle = now
-            logger.info(f"[API] stream_enabled -> {state.stream_enabled}")
-        k += 1
-        base_lat, base_lon = 56.1629, 10.2039
-        state.target_points = [
-            LatLon(base_lat + 0.001, base_lon + 0.001),
-            LatLon(base_lat + 0.001, base_lon - 0.001),
-            LatLon(base_lat - 0.001, base_lon - 0.001),
-            LatLon(base_lat - 0.001, base_lon + 0.001),
-        ]
-        if k % 5 == 0:
-            line = "TARGETS:" + ";".join(f"{p.lat:.6f},{p.lon:.6f}" for p in state.target_points)
-            await uart_tx_q.put(line)
+    """
+    Polls the website every cfg.poll_period_s:
+      - GET /api/stream-state  -> sets state.stream_enabled (bool)
+      - GET /api/circling-point -> sets state.target_points to [LatLon(lat,lng)]
+        If the point changes, sends a single TARGETS:lat,lon line to the ESP32.
+    """
+    base = "https://studio--sky-pointer.us-central1.hosted.app"
+    period = cfg.poll_period_s
+    last_sent_point = None  # (lat, lon) tuple to avoid spamming UART
+
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+        while not state.shutting_down:
+            await asyncio.sleep(period)
+
+            # ---- stream-state ----
+            try:
+                resp = await session.get(base + "/api/stream-state")
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    is_on = bool(data.get("isOn"))
+                    if is_on != state.stream_enabled:
+                        state.stream_enabled = is_on
+                        logger.info(f"[API] stream_enabled -> {state.stream_enabled}")
+                else:
+                    logger.info(f"[API] stream-state HTTP {resp.status}")
+            except Exception as e:
+                logger.info(f"[API] stream-state failed: {e}")
+
+            # ---- circling-point ----
+            try:
+                resp = await session.get(base + "/api/circling-point")
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    lat = data.get("lat")
+                    lng = data.get("lng")
+                    if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+                        # update in-memory state
+                        state.target_points = [LatLon(float(lat), float(lng))]
+                        # send to ESP32 only if changed
+                        key = (float(lat), float(lng))
+                        if key != last_sent_point:
+                            line = f"TARGETS:{lat:.6f},{lng:.6f}"
+                            await uart_tx_q.put(line)
+                            last_sent_point = key
+                            logger.info(f"[API] circling point -> {lat:.6f},{lng:.6f}")
+                elif resp.status == 404:
+                    # no active circling point
+                    state.target_points = []
+                else:
+                    logger.info(f"[API] circling-point HTTP {resp.status}")
+            except Exception as e:
+                logger.info(f"[API] circling-point failed: {e}")
 
 async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logger):
     """Simulated stream process start/stop based on stream flag."""
@@ -272,7 +302,6 @@ async def file_logger(state: RuntimeState, cfg: Config, logger: logging.Logger):
     finally:
         f.close()
 
-
 async def web_poster(state: RuntimeState, cfg: Config, logger: logging.Logger):
     import aiohttp
     url = "https://studio--sky-pointer.us-central1.hosted.app/api/drone-location"
@@ -305,8 +334,6 @@ async def web_poster(state: RuntimeState, cfg: Config, logger: logging.Logger):
                     logger.debug(f"[POST] ok {payload}")
             except Exception as e:
                 logger.info(f"[POST] failed: {e}")
-
-
 
 async def health_task(state: RuntimeState, cfg: Config, logger: logging.Logger):
     """Heartbeat every 5 seconds."""
