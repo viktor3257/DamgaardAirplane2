@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """
-airplane_pi.py — simple, self-contained async skeleton for the Pi.
+airplane_pi.py — async process for Raspberry Pi.
 
-What it does:
-- Simulates GPS, UART RX/TX, a "website" poller, a stream flag manager,
-  a CSV logger, a 1 Hz "web post" printer, and a heartbeat.
-- The CSV logger:
-    * On entry: finds the most recent previous flight log, renames it to the
-      current UTC time (e.g., 2025-10-13_09-58-22Z.csv), commits+pushes it,
-      and deletes it locally on success.
-    * Creates a new per-boot log: log/flight_YYYYmmdd_HHMMSSZ.csv
-    * Maintains log/latest.csv -> current flight (symlink).
-    * Flushes every row; fsyncs every 25 rows.
-
-Replace the SIMULATION parts with real hardware I/O when ready.
+Components:
+- GPS reader (SIM7600G-H NMEA → lat/lon, heading, ground speed)
+- ESP32 telemetry simulator (until real UART is wired)
+- Website poller (stream-state, circling-point)
+- Stream state manager
+- CSV logger (per boot; pushes previous log to Git and deletes it on success)
+- Web poster (POSTs location/telemetry to your API)
+- Health heartbeat
 """
 
 import os
@@ -34,27 +30,26 @@ from pathlib import Path
 from typing import List, Optional
 
 # ---------------------------
-# Configuration (baked-in)
+# Configuration
 # ---------------------------
 BASE_DIR = Path(__file__).resolve().parent
-REPO_ROOT = BASE_DIR.parent   # your Git repo root: DamgaardAirplane2
+REPO_ROOT = BASE_DIR.parent
 
 @dataclass
 class Config:
     # Paths
     log_dir: Path = BASE_DIR / "log"
-    # Git remote (only used if REPO_ROOT/.git exists)
     git_remote: str = "origin"
 
-    # Devices / I/O (used when you switch to real hardware)
+    # Devices (tweak when wiring real hardware)
     uart_dev: str = "/dev/ttyS0"
     uart_baud: int = 115_200
     gps_dev: str = "/dev/ttyAMA0"
 
     # Rates
-    poll_period_s: float = 1.0   # "website" poll period
-    log_rate_hz: float = 5.0     # CSV logging frequency
-    post_rate_hz: float = 1.0    # "web post" frequency
+    poll_period_s: float = 1.0   # website poll
+    log_rate_hz: float = 5.0     # CSV logging
+    post_rate_hz: float = 1.0    # HTTP POST
 
     # Logging verbosity
     debug: bool = True
@@ -89,8 +84,8 @@ class Telemetry:
     lat: float = math.nan
     lon: float = math.nan
     alt_m: float = math.nan
-    mode: int = 1               # 1=Neutral, 2=Manual, 3=Circling (from ESP32)
-    battery_pct: float = math.nan  # 0..100 (from ESP32)
+    mode: int = 1                 # 1=Neutral, 2=Manual, 3=Circling (from ESP32)
+    battery_pct: float = math.nan # 0..100 (from ESP32)
 
 @dataclass
 class RuntimeState:
@@ -102,37 +97,128 @@ class RuntimeState:
 
 
 # ---------------------------
-# SIMULATION tasks (swap later)
+# GPS (SIM7600G-H via NMEA)
 # ---------------------------
 async def gps_reader(state: RuntimeState, cfg: Config, logger: logging.Logger):
-    """Simulate a GPS near Aarhus at 5 Hz."""
-    lat0, lon0 = 56.1629, 10.2039
-    while not state.shutting_down:
-        await asyncio.sleep(0.2)
-        state.latest_gps = GpsFix(
-            time_utc=time.time(),
-            lat=lat0 + (random.random() - 0.5) * 1e-4,
-            lon=lon0 + (random.random() - 0.5) * 1e-4,
-            alt_m=60.0 + (random.random() - 0.5) * 5.0,
-            fix_ok=True,
-            sats=10 + random.randint(-2, 3),
-        )
+    """
+    Read NMEA sentences from SIM7600G-H and update:
+      - state.latest_gps.lat / lon / time_utc / fix_ok
+      - state.latest_esp32.groundspeed_ms (from RMC/VTG)
+      - state.latest_esp32.yaw_deg (course/heading from RMC/VTG)
+    Notes:
+      - NMEA is often on /dev/ttyUSB1; AT commands on /dev/ttyUSB2.
+      - Tries to power GNSS once via AT; continues even if that fails.
+    """
+    import serial  # local import keeps import errors isolated
 
+    nmea_port = "/dev/ttyUSB1"  # change if your NMEA port differs
+    at_port   = "/dev/ttyUSB2"  # AT command port (best-effort power on)
+
+    # Power GNSS (best-effort)
+    try:
+        at = serial.Serial(at_port, 115200, timeout=1)
+        for cmd in ("AT", "AT+CGNSPWR=1", "AT+CGNSSEQ=RMC", "AT+CGNSURC=0"):
+            at.write((cmd + "\r\n").encode())
+            at.read_until(b"OK\r\n")
+        at.close()
+    except Exception as e:
+        logger.debug(f"[SIM7600] AT init skipped: {e}")
+
+    # Open NMEA stream
+    try:
+        s = serial.Serial(nmea_port, 115200, timeout=0.2)
+    except Exception as e:
+        logger.info(f"[SIM7600] cannot open {nmea_port}: {e}")
+        while not state.shutting_down:
+            await asyncio.sleep(1.0)
+        return
+
+    logger.info(f"[SIM7600] NMEA on {nmea_port} started")
+
+    # Inline converters
+    def nmea_deg(dm, hemi):
+        try:
+            v = float(dm)
+            deg = int(v // 100)
+            minutes = v - deg * 100
+            d = deg + minutes / 60.0
+            if hemi in ("S", "W"):
+                d = -d
+            return d
+        except Exception:
+            return math.nan
+
+    def to_float(x):
+        try:
+            return float(x)
+        except Exception:
+            return math.nan
+
+    while not state.shutting_down:
+        await asyncio.sleep(0)  # yield to event loop
+        try:
+            line = s.readline().decode(errors="ignore").strip()
+            if not line or line[0] != "$":
+                continue
+            if "*" in line:
+                line = line.split("*", 1)[0]
+            parts = line.split(",")
+            kind = parts[0]
+
+            # RMC: pos/speed/track
+            if kind.endswith("RMC") and len(parts) >= 12:
+                if parts[2] == "A":  # valid
+                    lat = nmea_deg(parts[3], parts[4])
+                    lon = nmea_deg(parts[5], parts[6])
+                    sog_knots = to_float(parts[7])
+                    cog_deg = to_float(parts[8])
+
+                    state.latest_gps.time_utc = time.time()
+                    state.latest_gps.lat = lat
+                    state.latest_gps.lon = lon
+                    state.latest_gps.fix_ok = True
+
+                    if math.isfinite(sog_knots):
+                        state.latest_esp32.groundspeed_ms = sog_knots * 0.514444
+                    if math.isfinite(cog_deg):
+                        state.latest_esp32.yaw_deg = cog_deg % 360.0
+
+            # VTG: course/speed
+            elif kind.endswith("VTG") and len(parts) >= 9:
+                cog = to_float(parts[1])       # true course (deg)
+                sog_knots = to_float(parts[5]) # speed in knots
+                if math.isfinite(cog):
+                    state.latest_esp32.yaw_deg = cog % 360.0
+                if math.isfinite(sog_knots):
+                    state.latest_esp32.groundspeed_ms = sog_knots * 0.514444
+
+        except Exception:
+            continue
+
+    try:
+        s.close()
+    except Exception:
+        pass
+    logger.info("[SIM7600] NMEA reader stopped")
+
+# ---------------------------
+# ESP32 telemetry (simulated)
+# ---------------------------
 async def esp32_uart_rx(state: RuntimeState, cfg: Config, logger: logging.Logger):
     t0 = time.time()
     while not state.shutting_down:
         await asyncio.sleep(0.05)
         t = time.time() - t0
-        mode_sim = [1, 2, 3][int(t // 10) % 3]     # cycles every 10s
-        pct_sim  = 80 + 15*math.sin(t/30)          # ~65..95% just for demo
+        mode_sim = [1, 2, 3][int(t // 10) % 3]  # cycles every 10s
+        pct_sim  = 80 + 15 * math.sin(t / 30)   # ~65..95%
         state.latest_esp32 = Telemetry(
             time_utc=time.time(),
             batt_v=11.1 + 0.2 * math.sin(t / 10),
             airspeed_ms=10 + 2 * math.sin(t),
-            groundspeed_ms=8 + 1.5 * math.sin(t / 2),
+            groundspeed_ms=state.latest_esp32.groundspeed_ms,  # updated by GPS task
             roll_deg=10 * math.sin(t * 0.7),
             pitch_deg=5 * math.sin(t * 0.5),
-            yaw_deg=(t * 20) % 360,
+            yaw_deg=state.latest_esp32.yaw_deg,                # updated by GPS task
             lat=state.latest_gps.lat,
             lon=state.latest_gps.lon,
             alt_m=state.latest_gps.alt_m,
@@ -140,9 +226,8 @@ async def esp32_uart_rx(state: RuntimeState, cfg: Config, logger: logging.Logger
             battery_pct=max(0, min(100, pct_sim)),
         )
 
-
 async def esp32_uart_tx(uart_tx_q: asyncio.Queue, state: RuntimeState, cfg: Config, logger: logging.Logger):
-    """Simulate sending commands to ESP32 by printing them."""
+    """Send commands to ESP32 (simulated: print)."""
     while not state.shutting_down:
         try:
             msg = await asyncio.wait_for(uart_tx_q.get(), timeout=0.5)
@@ -151,22 +236,24 @@ async def esp32_uart_tx(uart_tx_q: asyncio.Queue, state: RuntimeState, cfg: Conf
         logger.info(f"[UART->ESP32] {msg}")
         uart_tx_q.task_done()
 
+# ---------------------------
+# Website poller
+# ---------------------------
 async def website_poller(state: RuntimeState, uart_tx_q: asyncio.Queue, cfg: Config, logger: logging.Logger):
     """
-    Polls the website every cfg.poll_period_s:
-      - GET /api/stream-state  -> sets state.stream_enabled (bool)
-      - GET /api/circling-point -> sets state.target_points to [LatLon(lat,lng)]
-        If the point changes, sends a single TARGETS:lat,lon line to the ESP32.
+    Poll every cfg.poll_period_s:
+      - GET /api/stream-state -> update stream_enabled
+      - GET /api/circling-point -> set target_points and send a TARGETS:lat,lon line on change
     """
     base = "https://studio--sky-pointer.us-central1.hosted.app"
     period = cfg.poll_period_s
-    last_sent_point = None  # (lat, lon) tuple to avoid spamming UART
+    last_sent_point = None  # (lat, lon)
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
         while not state.shutting_down:
             await asyncio.sleep(period)
 
-            # ---- stream-state ----
+            # stream-state
             try:
                 resp = await session.get(base + "/api/stream-state")
                 if resp.status == 200:
@@ -180,7 +267,7 @@ async def website_poller(state: RuntimeState, uart_tx_q: asyncio.Queue, cfg: Con
             except Exception as e:
                 logger.info(f"[API] stream-state failed: {e}")
 
-            # ---- circling-point ----
+            # circling-point
             try:
                 resp = await session.get(base + "/api/circling-point")
                 if resp.status == 200:
@@ -188,57 +275,58 @@ async def website_poller(state: RuntimeState, uart_tx_q: asyncio.Queue, cfg: Con
                     lat = data.get("lat")
                     lng = data.get("lng")
                     if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
-                        # update in-memory state
                         state.target_points = [LatLon(float(lat), float(lng))]
-                        # send to ESP32 only if changed
                         key = (float(lat), float(lng))
                         if key != last_sent_point:
-                            line = f"TARGETS:{lat:.6f},{lng:.6f}"
-                            await uart_tx_q.put(line)
+                            await uart_tx_q.put(f"TARGETS:{lat:.6f},{lng:.6f}")
                             last_sent_point = key
                             logger.info(f"[API] circling point -> {lat:.6f},{lng:.6f}")
                 elif resp.status == 404:
-                    # no active circling point
                     state.target_points = []
                 else:
                     logger.info(f"[API] circling-point HTTP {resp.status}")
             except Exception as e:
                 logger.info(f"[API] circling-point failed: {e}")
 
+# ---------------------------
+# Stream manager
+# ---------------------------
 async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logger):
-    """Simulated stream process start/stop based on stream flag."""
+    """Log when the stream flag turns on/off."""
     running = False
     while not state.shutting_down:
         await asyncio.sleep(0.2)
         if state.stream_enabled and not running:
             running = True
-            logger.info("[STREAM] Starting simulated stream...")
+            logger.info("[STREAM] starting")
         elif not state.stream_enabled and running:
             running = False
-            logger.info("[STREAM] Stopping simulated stream...")
+            logger.info("[STREAM] stopping")
     if running:
-        logger.info("[STREAM] Stopping simulated stream (shutdown).")
+        logger.info("[STREAM] stopping (shutdown)")
 
+# ---------------------------
+# CSV logger
+# ---------------------------
 async def file_logger(state: RuntimeState, cfg: Config, logger: logging.Logger):
     """
-    Simple CSV logger.
-    - On entry: rename previous flight to local(UTC+2) time 'YYYY-mm-dd_HH-MM.csv',
-      git add/commit/push it, and delete it if push succeeds.
-    - Then create 'flight_YYYYmmdd_HHMM.csv' for this boot and append rows.
+    On start:
+      - Rename previous flight to local (UTC+2) 'YYYY-mm-dd_HH-MM.csv'
+      - git add/commit/push; delete the file locally if push succeeds
+    Then:
+      - Create 'flight_YYYYmmdd_HHMM.csv' for this boot and append rows
     """
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- 1) Push previous flight (best-effort) ----
+    # Push previous flight (best-effort)
     prevs = sorted(cfg.log_dir.glob("flight_*.csv"))
     if prevs and (REPO_ROOT / ".git").exists():
-        # Use "local" name = UTC+2, no trailing 'Z'
         local_now = datetime.utcnow() + timedelta(hours=2)
         pushed_name = local_now.strftime("%Y-%m-%d_%H-%M") + ".csv"
         prev = prevs[-1]
         target = prev.with_name(pushed_name)
         try:
             prev.rename(target)
-            # If logs are ignored by .gitignore, keep "-f" to force-add
             subprocess.run(["git", "-C", str(REPO_ROOT), "add", "-f", str(target)], check=False)
             subprocess.run(["git", "-C", str(REPO_ROOT), "commit", "-m", f"Flight log {target.name}"], check=False)
             r = subprocess.run(["git", "-C", str(REPO_ROOT), "push", "origin", "HEAD"], check=False)
@@ -255,16 +343,18 @@ async def file_logger(state: RuntimeState, cfg: Config, logger: logging.Logger):
     else:
         logger.info("No previous log to push or not a git repo.")
 
-    # ---- 2) New log for this boot ----
+    # New log for this boot
     local_now = datetime.utcnow() + timedelta(hours=2)
     current_path = cfg.log_dir / f"flight_{local_now.strftime('%Y%m%d_%H%M')}.csv"
     f = current_path.open("w", newline="")
     writer = csv.writer(f)
-    writer.writerow(["ts_iso","batt_v","airspeed_ms","groundspeed_ms",
-                     "roll_deg","pitch_deg","yaw_deg","lat","lon","alt_m"])
+    writer.writerow([
+        "ts_iso","batt_v","airspeed_ms","groundspeed_ms",
+        "roll_deg","pitch_deg","yaw_deg","lat","lon","alt_m"
+    ])
     f.flush()
 
-    # latest symlink (optional, best-effort)
+    # latest symlink
     latest = cfg.log_dir / "latest.csv"
     try:
         if latest.exists() or latest.is_symlink():
@@ -274,12 +364,11 @@ async def file_logger(state: RuntimeState, cfg: Config, logger: logging.Logger):
         pass
     logger.info(f"Logging to {current_path}")
 
-    # ---- 3) Append rows ----
+    # Append rows
     period = 1.0 / max(cfg.log_rate_hz, 1.0)
 
     def ts_iso(ts_val: Optional[float]) -> str:
-        # Use provided ts if it looks valid; otherwise "now" (UTC, ISO8601)
-        base = datetime.fromtimestamp(ts_val, tz=timezone.utc) if (isinstance(ts_val, (int,float)) and math.isfinite(ts_val)) else datetime.now(tz=timezone.utc)
+        base = datetime.fromtimestamp(ts_val, tz=timezone.utc) if (isinstance(ts_val, (int, float)) and math.isfinite(ts_val)) else datetime.now(tz=timezone.utc)
         return base.isoformat()
 
     def fmt(x, nd):
@@ -302,8 +391,10 @@ async def file_logger(state: RuntimeState, cfg: Config, logger: logging.Logger):
     finally:
         f.close()
 
+# ---------------------------
+# Web poster
+# ---------------------------
 async def web_poster(state: RuntimeState, cfg: Config, logger: logging.Logger):
-    import aiohttp
     url = "https://studio--sky-pointer.us-central1.hosted.app/api/drone-location"
     period = 1.0 / max(cfg.post_rate_hz, 1.0)
     headers = {"Content-Type": "application/json"}
@@ -314,7 +405,9 @@ async def web_poster(state: RuntimeState, cfg: Config, logger: logging.Logger):
             te = state.latest_esp32
             gp = state.latest_gps
 
-            mode_str = {1: "Neutral", 2: "Manual", 3: "Circling"}.get(int(te.mode) if isinstance(te.mode, (int, float)) else 1, "Neutral")
+            mode_str = {1: "Neutral", 2: "Manual", 3: "Circling"}.get(
+                int(te.mode) if isinstance(te.mode, (int, float)) else 1, "Neutral"
+            )
 
             payload = {
                 "lat": float(f"{gp.lat:.6f}") if isinstance(gp.lat, (int,float)) and math.isfinite(gp.lat) else 0.0,
@@ -329,18 +422,12 @@ async def web_poster(state: RuntimeState, cfg: Config, logger: logging.Logger):
             try:
                 r = await session.post(url, json=payload, headers=headers)
                 if r.status >= 400:
-                    logger.info(f"[POST] {r.status} {await r.text()[:200]}")
+                    txt = await r.text()
+                    logger.info(f"[POST] {r.status} {txt[:200]}")
                 else:
                     logger.debug(f"[POST] ok {payload}")
             except Exception as e:
                 logger.info(f"[POST] failed: {e}")
-
-async def health_task(state: RuntimeState, cfg: Config, logger: logging.Logger):
-    """Heartbeat every 5 seconds."""
-    while not state.shutting_down:
-        await asyncio.sleep(5.0)
-        logger.debug("[HEALTH] alive")
-
 
 # ---------------------------
 # Main
@@ -359,10 +446,9 @@ async def main_async():
     logger = setup_logging(cfg.debug)
     state = RuntimeState()
 
-    # Shared queue for outbound UART lines (simulated)
     uart_tx_q: asyncio.Queue[str] = asyncio.Queue(maxsize=100)
 
-    # Signals for graceful stop
+    # Signals
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -370,16 +456,25 @@ async def main_async():
         except NotImplementedError:
             pass
 
-    tasks = [
-        asyncio.create_task(gps_reader(state, cfg, logger)),
-        asyncio.create_task(esp32_uart_rx(state, cfg, logger)),
-        asyncio.create_task(esp32_uart_tx(uart_tx_q, state, cfg, logger)),
-        asyncio.create_task(website_poller(state, uart_tx_q, cfg, logger)),
-        asyncio.create_task(stream_manager(state, cfg, logger)),
-        asyncio.create_task(file_logger(state, cfg, logger)),   # handles push-previous + new-log creation
-        asyncio.create_task(web_poster(state, cfg, logger)),
-        asyncio.create_task(health_task(state, cfg, logger)),
+    # --- start tasks with per-step delay before each start ---
+    tasks = []
+
+    # Each tuple: (delay_before_seconds, start_task_callable)
+    startup_steps = [
+        (5.0, lambda: asyncio.create_task(gps_reader(state, cfg, logger))),
+        (3.0, lambda: asyncio.create_task(file_logger(state, cfg, logger))),
+        (1.0, lambda: asyncio.create_task(website_poller(state, uart_tx_q, cfg, logger))),
+        (0.5, lambda: asyncio.create_task(web_poster(state, cfg, logger))),
+        (0.5, lambda: asyncio.create_task(esp32_uart_rx(state, cfg, logger))),
+        (0.5, lambda: asyncio.create_task(esp32_uart_tx(uart_tx_q, state, cfg, logger))),
+        (0.5, lambda: asyncio.create_task(stream_manager(state, cfg, logger))),
     ]
+
+    for delay_before, start_fn in startup_steps:
+        if delay_before > 0:
+            await asyncio.sleep(delay_before)
+        tasks.append(start_fn())
+
 
     logger.info("airplane_pi started. Press Ctrl+C to stop.")
     try:
