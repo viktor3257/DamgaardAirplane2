@@ -1,6 +1,6 @@
 #include <Arduino.h>
 #include "job_registry.h"
-#include "control_jobs.h"
+#include "sensor_jobs.h"
 #include "comms_jobs.h"
 #include "logging.h"
 
@@ -10,7 +10,7 @@ void setup() {
   Serial.begin(115200);
   while (!Serial) { /* wait if needed */ }
 
-  register_control_jobs(REG);
+  register_sensor_jobs(REG);
   register_comms_jobs(REG);
   register_logging(REG);
 
