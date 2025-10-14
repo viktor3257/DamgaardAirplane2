@@ -19,3 +19,14 @@ int     g_pot1_raw = 0;
 int     g_pot2_raw = 0;
 int     g_joy1x_raw = 0;
 int     g_joy1y_raw = 0;
+
+ControllerMode g_controller_mode = CONTROLLER_MODE_NEUTRAL;
+
+ControllerSettings g_controller_settings = {
+    100,  // initial_battery_percent
+    50,   // responsiveness_percent
+    3,    // trim_degrees
+    50,   // auto_altitude_meters
+    40,   // auto_taxi_speed_kph
+    40,   // auto_circle_speed_kph
+};
