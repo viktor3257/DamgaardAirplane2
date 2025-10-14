@@ -44,8 +44,7 @@ namespace {
   bool g_radio_initialized = false;
 
   struct __attribute__((packed)) ControlPacket {
-    char    magic[2];
-    uint8_t version;
+    char    magic;
     uint8_t mode;
     float   throttle;
     float   roll;
@@ -77,10 +76,7 @@ namespace {
   }
 
   bool decode_control_packet(const ControlPacket& packet) {
-    if (packet.magic[0] != 'R' || packet.magic[1] != 'C') {
-      return false;
-    }
-    if (packet.version != 1) {
+    if (packet.magic != 'R') {
       return false;
     }
 
