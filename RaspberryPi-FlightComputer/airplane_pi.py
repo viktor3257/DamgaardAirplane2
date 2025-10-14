@@ -5,11 +5,11 @@ airplane_pi.py — async process for Raspberry Pi.
 Components:
 - GPS reader (SIM7600G-H NMEA → lat/lon, heading, ground speed)
 - ESP32 telemetry simulator (until real UART is wired)
+- Web poster (POSTs location/telemetry to your API)
 - Website poller (stream-state, circling-point)
 - Stream state manager
-- CSV logger (per boot; pushes previous log to Git and deletes it on success)
-- Web poster (POSTs location/telemetry to your API)
-- Health heartbeat
+- CSV logger 
+
 """
 
 import os
@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Optional
-import subprocess, os, time
+
 
 # ---------------------------
 # Configuration
@@ -432,7 +432,6 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
                     start_pipeline()
     finally:
         stop_pipeline()
-
 
 # ---------------------------
 # CSV logger
