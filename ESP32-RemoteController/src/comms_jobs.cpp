@@ -48,8 +48,7 @@ namespace {
   }
 
   struct __attribute__((packed)) ControlPacket {
-    char    magic[2];
-    uint8_t version;
+    char    magic;
     uint8_t mode;
     float   throttle;
     float   roll;
@@ -62,9 +61,7 @@ namespace {
     }
 
     ControlPacket packet{};
-    packet.magic[0] = 'R';
-    packet.magic[1] = 'C';
-    packet.version  = 1;
+    packet.magic    = 'R';
     packet.mode     = static_cast<uint8_t>(g_controller_mode);
     packet.throttle = g_control_knob1;
     packet.roll     = g_control_joy_rx;
