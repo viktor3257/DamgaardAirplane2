@@ -3,6 +3,7 @@
 #include "sensor_jobs.h"
 #include "comms_jobs.h"
 #include "logging.h"
+#include "display_jobs.h"
 
 static JobRegistry REG;
 
@@ -11,6 +12,7 @@ void setup() {
   while (!Serial) { /* wait if needed */ }
 
   register_sensor_jobs(REG);
+  register_display_jobs(REG);
   register_comms_jobs(REG);
   register_logging(REG);
 
