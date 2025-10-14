@@ -55,7 +55,7 @@ class Config:
     # Logging verbosity
     debug: bool = True
 
-     # Streaming
+    # Streaming
     rtmp_url: str = "rtmp://a.rtmp.youtube.com/live2"
     rtmp_key: str = "bq45-5jky-84s0-cy0y-e8uy"
     cam_width: int = 1280
@@ -305,7 +305,7 @@ async def website_poller(state: RuntimeState, uart_tx_q: asyncio.Queue, cfg: Con
 async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logger):
     """
     Start/stop YouTube stream based on state.stream_enabled.
-    rpicam-vid (H.264) -> ffmpeg (copy) -> RTMP to YouTube.
+    rpicam-vid (H.264) --nopreview -> ffmpeg (copy video + silent AAC) -> RTMP.
     """
     import subprocess, time, shutil
 
@@ -316,26 +316,35 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
             await asyncio.sleep(5.0)
         return
 
-    # Keep rpicam-vid flags minimal and compatible
     cam_cmd = [
         cam_bin,
-        "--inline",                         # SPS/PPS in-band for RTMP
+        "--nopreview",
+        "--inline",
+        "--codec", "h264",
+        "--profile", "high",
+        "--level", "4.1",
         "--width", str(cfg.cam_width),
         "--height", str(cfg.cam_height),
         "--framerate", str(cfg.cam_fps),
-        "--rotation", str(cfg.cam_rotation_deg),  # 180 = flipped
+        "--rotation", str(cfg.cam_rotation_deg),
         "--bitrate", str(cfg.cam_bitrate_kbps * 1000),
         "--intra", str(cfg.cam_fps * 2),   # ~2s keyframe interval
-        "-t", "0",                         # run until killed
-        "-o", "-",                         # write H264 to stdout
+        "-t", "0",
+        "-o", "-",                          # H.264 to stdout
     ]
 
+    # Add a silent audio source; some YouTube ingest paths prefer A/V
     ffmpeg_cmd = [
         "ffmpeg",
-        "-re",                 # pace input for RTMP
-        "-i", "pipe:0",
-        "-c:v", "copy",        # copy H264 (no re-encode)
-        "-an",                 # no audio
+        "-re",
+        "-thread_queue_size", "1024",
+        "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-thread_queue_size", "1024",
+        "-fflags", "+genpts",
+        "-use_wallclock_as_timestamps", "1",
+        "-i", "pipe:0",                    # video from rpicam-vid
+        "-c:v", "copy",                    # copy H.264 (no re-encode)
+        "-c:a", "aac", "-b:a", "128k",
         "-f", "flv",
         f"{cfg.rtmp_url}/{cfg.rtmp_key}",
     ]
@@ -351,21 +360,20 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
         try:
             cam_proc = subprocess.Popen(
                 cam_cmd,
-                stdout=subprocess.PIPE,      # feed to ffmpeg
-                stderr=subprocess.DEVNULL,   # avoid blocking on stderr
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 bufsize=0
             )
             ffmpeg_proc = subprocess.Popen(
                 ffmpeg_cmd,
                 stdin=cam_proc.stdout,
-                stdout=subprocess.DEVNULL,   # drop ffmpeg stdout
-                stderr=subprocess.DEVNULL    # avoid blocking on stderr
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
             )
             running = True
             logger.info("[STREAM] started (rpicam-vid → ffmpeg → RTMP)")
         except Exception as e:
             logger.info(f"[STREAM] failed to start: {e}")
-            # cleanup partial
             try:
                 if ffmpeg_proc and ffmpeg_proc.poll() is None:
                     ffmpeg_proc.terminate()
@@ -404,14 +412,11 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
     try:
         while not state.shutting_down:
             await asyncio.sleep(0.25)
-
-            # start/stop based on toggle
             if state.stream_enabled and not running:
                 start_pipeline()
             elif not state.stream_enabled and running:
                 stop_pipeline()
 
-            # if enabled, ensure pipeline stays alive
             if state.stream_enabled and running:
                 dead = False
                 try:
@@ -427,6 +432,7 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
                     start_pipeline()
     finally:
         stop_pipeline()
+
 
 # ---------------------------
 # CSV logger
