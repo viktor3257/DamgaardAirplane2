@@ -1,4 +1,4 @@
-#include "control_jobs.h"
+#include "sensor_jobs.h"
 #include "globals.h"
 #include <Arduino.h>
 
@@ -18,6 +18,7 @@ constexpr int kJoy1XPin = 34;
 constexpr int kJoy1YPin = 35;
 
 constexpr uint32_t kButtonPollIntervalMs = 10;
+constexpr uint32_t kSwitchPollIntervalMs = 10;
 constexpr uint32_t kPotPollIntervalMs    = 20;
 constexpr uint32_t kJoyPollIntervalMs    = 20;
 constexpr uint32_t kDebounceMs           = 40;
@@ -46,34 +47,12 @@ static DebouncedButton g_buttons[] = {
 static int g_j1x_mid = 2048;
 static int g_j1y_mid = 2048;
 
-bool cond_always_true() { return true; }
+void job_buttons();
+void job_potentiometers();
+void job_switches();
+void job_joystick();
 
-int mapJoystick(int raw, int minVal, int midVal, int maxVal, bool invert) {
-  int out;
-  if (raw <= midVal) {
-    out = map(raw, minVal, midVal, 0, 50);
-  } else {
-    out = map(raw, midVal, maxVal, 50, 99);
-  }
-  out = constrain(out, 0, 99);
-  return invert ? (99 - out) : out;
-}
-
-int calibrateAxis(int pin, int samples = 20) {
-  long sum = 0;
-  for (int i = 0; i < samples; ++i) {
-    sum += analogRead(pin);
-    delay(5);
-  }
-  return static_cast<int>(sum / samples);
-}
-
-void calibrateJoysticks() {
-  g_j1x_mid = calibrateAxis(kJoy1XPin);
-  g_j1y_mid = calibrateAxis(kJoy1YPin);
-}
-
-void initButtons(uint32_t now_ms) {
+void init_buttons(uint32_t now_ms) {
   for (auto& btn : g_buttons) {
     pinMode(btn.pin, INPUT_PULLUP);
     const bool pressed = (digitalRead(btn.pin) == LOW);
@@ -84,39 +63,54 @@ void initButtons(uint32_t now_ms) {
   }
 }
 
-void initSwitches() {
+void init_potentiometers() {
+  pinMode(kPot1Pin, INPUT);
+  pinMode(kPot2Pin, INPUT);
+  job_potentiometers();
+}
+
+void init_switches() {
   pinMode(kSwitch1Pin, INPUT_PULLUP);
   pinMode(kSwitch2Pin, INPUT_PULLUP);
-  g_switch1_state = (digitalRead(kSwitch1Pin) == LOW) ? 1 : 0;
-  g_switch2_state = (digitalRead(kSwitch2Pin) == LOW) ? 1 : 0;
+  job_switches();
 }
 
-void updateButton(DebouncedButton& btn, uint32_t now_ms) {
-  const bool sample_pressed = (digitalRead(btn.pin) == LOW);
-  if (sample_pressed != btn.last_sample) {
-    btn.last_sample    = sample_pressed;
-    btn.last_change_ms = now_ms;
-  }
+void init_joystick() {
+  pinMode(kJoy1XPin, INPUT);
+  pinMode(kJoy1YPin, INPUT);
 
-  if ((now_ms - btn.last_change_ms) >= kDebounceMs &&
-      sample_pressed != btn.stable_pressed) {
-    btn.stable_pressed = sample_pressed;
+  long sum_x = 0;
+  long sum_y = 0;
+  constexpr int kSamples = 20;
+  for (int i = 0; i < kSamples; ++i) {
+    sum_x += analogRead(kJoy1XPin);
+    sum_y += analogRead(kJoy1YPin);
+    delay(5);
   }
+  g_j1x_mid = static_cast<int>(sum_x / kSamples);
+  g_j1y_mid = static_cast<int>(sum_y / kSamples);
 
-  *btn.output = btn.stable_pressed ? 1 : 0;
+  job_joystick();
 }
 
-void job_read_buttons_and_switches() {
+void job_buttons() {
   const uint32_t now = millis();
   for (auto& btn : g_buttons) {
-    updateButton(btn, now);
-  }
+    const bool sample_pressed = (digitalRead(btn.pin) == LOW);
+    if (sample_pressed != btn.last_sample) {
+      btn.last_sample    = sample_pressed;
+      btn.last_change_ms = now;
+    }
 
-  g_switch1_state = (digitalRead(kSwitch1Pin) == LOW) ? 1 : 0;
-  g_switch2_state = (digitalRead(kSwitch2Pin) == LOW) ? 1 : 0;
+    if ((now - btn.last_change_ms) >= kDebounceMs) {
+      btn.stable_pressed = sample_pressed;
+    }
+
+    *btn.output = btn.stable_pressed ? 1 : 0;
+  }
 }
 
-void job_read_potentiometers() {
+void job_potentiometers() {
   g_pot1_raw = analogRead(kPot1Pin);
   g_pot2_raw = analogRead(kPot2Pin);
 
@@ -127,40 +121,64 @@ void job_read_potentiometers() {
   g_control_knob2 = static_cast<float>(pot2_val) / 99.0f;
 }
 
-void job_read_joystick() {
+void job_switches() {
+  g_switch1_state = (digitalRead(kSwitch1Pin) == LOW) ? 1 : 0;
+  g_switch2_state = (digitalRead(kSwitch2Pin) == LOW) ? 1 : 0;
+}
+
+void job_joystick() {
   g_joy1x_raw = analogRead(kJoy1XPin);
   g_joy1y_raw = analogRead(kJoy1YPin);
 
-  const int jx_val = mapJoystick(g_joy1x_raw, J1X_MIN, g_j1x_mid, J1X_MAX, false);
-  const int jy_val = mapJoystick(g_joy1y_raw, J1Y_MIN, g_j1y_mid, J1Y_MAX, false);
+  int jx_val;
+  if (g_joy1x_raw <= g_j1x_mid) {
+    jx_val = map(g_joy1x_raw, J1X_MIN, g_j1x_mid, 0, 50);
+  } else {
+    jx_val = map(g_joy1x_raw, g_j1x_mid, J1X_MAX, 50, 99);
+  }
+  int jy_val;
+  if (g_joy1y_raw <= g_j1y_mid) {
+    jy_val = map(g_joy1y_raw, J1Y_MIN, g_j1y_mid, 0, 50);
+  } else {
+    jy_val = map(g_joy1y_raw, g_j1y_mid, J1Y_MAX, 50, 99);
+  }
+
+  jx_val = constrain(jx_val, 0, 99);
+  jy_val = constrain(jy_val, 0, 99);
 
   g_control_joy_rx = static_cast<float>(jx_val) / 99.0f;
   g_control_joy_ry = static_cast<float>(jy_val) / 99.0f;
 }
 
-void initialise_inputs() {
-  const uint32_t now_ms = millis();
-  initButtons(now_ms);
-  initSwitches();
-  calibrateJoysticks();
-
-  job_read_potentiometers();
-  job_read_joystick();
-}
 } // namespace
 
-void register_control_jobs(JobRegistry& R) {
-  initialise_inputs();
+void register_sensor_jobs(JobRegistry& R) {
+  const uint32_t now_ms = millis();
+  init_buttons(now_ms);
+  init_potentiometers();
+  init_switches();
+  init_joystick();
 
   R.add({
-      "ctl_buttons_switches",
+      "ctl_buttons",
       JOB_TIMER,
       kButtonPollIntervalMs,
       0,
       true,
       false,
-      cond_always_true,
-      job_read_buttons_and_switches,
+      nullptr,
+      job_buttons,
+  });
+
+  R.add({
+      "ctl_switches",
+      JOB_TIMER,
+      kSwitchPollIntervalMs,
+      0,
+      true,
+      false,
+      nullptr,
+      job_switches,
   });
 
   R.add({
@@ -170,8 +188,8 @@ void register_control_jobs(JobRegistry& R) {
       0,
       true,
       false,
-      cond_always_true,
-      job_read_potentiometers,
+      nullptr,
+      job_potentiometers,
   });
 
   R.add({
@@ -181,7 +199,7 @@ void register_control_jobs(JobRegistry& R) {
       0,
       true,
       false,
-      cond_always_true,
-      job_read_joystick,
+      nullptr,
+      job_joystick,
   });
 }
