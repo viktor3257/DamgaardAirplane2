@@ -1,18 +1,26 @@
 #include <Arduino.h>
+#include "job_registry.h"
+#include "control_jobs.h"
+#include "comms_jobs.h"
+#include "logging.h"
 
-// put function declarations here:
-int myFunction(int, int);
+static JobRegistry REG;
 
 void setup() {
-  // put your setup code here, to run once:
-  int result = myFunction(2, 3);
+  Serial.begin(115200);
+  while (!Serial) { /* wait if needed */ }
+
+  register_control_jobs(REG);
+  register_comms_jobs(REG);
+  register_logging(REG);
+
+  Serial.print("Jobs registered: ");
+  Serial.println(REG.size());
 }
 
 void loop() {
-  // put your main code here, to run repeatedly:
-}
+  const uint32_t now = millis();
 
-// put function definitions here:
-int myFunction(int x, int y) {
-  return x + y;
+  REG.evaluate(now);
+  REG.execute(now);
 }
