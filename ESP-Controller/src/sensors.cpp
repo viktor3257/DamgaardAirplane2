@@ -174,7 +174,7 @@ void readSensors()
         g_button3Flag = false;
         g_desiredAirplaneMode = AIRPLANE_MODE_AREA_SEARCH;
     }
-    // Button 4 is handled by the display/menu system.
+    // Switch 2 is handled by the display/menu system.
 }
 
 void updateServo() {}
