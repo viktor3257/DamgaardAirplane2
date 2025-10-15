@@ -181,13 +181,13 @@ static void handleRx() {
   beginRx();
   if (st != RADIOLIB_ERR_NONE || len < 2) return;
 
-  if (len == sizeof(ControlPacket)) {
+  if (len >= sizeof(ControlPacket)) {
     const ControlPacket *pkt = reinterpret_cast<const ControlPacket*>(buffer);
     if (pkt->id0 == kControlId0 && pkt->id1 == kControlId1) {
       processControl(*pkt);
       s_rxCount++;
     }
-  } else if (len == sizeof(SettingsPacket)) {
+  } else if (len >= sizeof(SettingsPacket)) {
     const SettingsPacket *pkt = reinterpret_cast<const SettingsPacket*>(buffer);
     if (pkt->id0 == kSettingsId0 && pkt->id1 == kSettingsId1) {
       processSettings(*pkt);
