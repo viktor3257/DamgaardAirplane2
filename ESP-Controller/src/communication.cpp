@@ -19,29 +19,24 @@ static inline void goRx() { digitalWrite(kRxEnPin, HIGH); }
 static inline void goTx() { digitalWrite(kRxEnPin, LOW);  }
 
 // ============================== Protocol ====================================
-static constexpr uint8_t kControlId0  = 'C';
-static constexpr uint8_t kControlId1  = 'T';
-static constexpr uint8_t kSettingsId0 = 'S';
-static constexpr uint8_t kSettingsId1 = 'T';
-static constexpr uint8_t kTelemetryId0 = 'T';
-static constexpr uint8_t kTelemetryId1 = 'L';
+static constexpr uint8_t kControlId   = 'C';
+static constexpr uint8_t kSettingsId  = 'S';
+static constexpr uint8_t kTelemetryId = 'T';
 
 static constexpr uint32_t kControlPeriodMs   = 100;   // 10 Hz
 static constexpr uint32_t kControllerTimeout = 5000;  // ms
 
 struct __attribute__((packed)) ControlPacket {
-  uint8_t id0;
-  uint8_t id1;
+  uint8_t id;
   uint8_t mode;
   uint8_t throttle;
   uint8_t pitch;
   uint8_t roll;
 };
-static_assert(sizeof(ControlPacket) == 6, "ControlPacket size");
+static_assert(sizeof(ControlPacket) == 5, "ControlPacket size");
 
 struct __attribute__((packed)) SettingsPacket {
-  uint8_t id0;
-  uint8_t id1;
+  uint8_t id;
   uint8_t initialBattery;
   uint8_t responsiveness;
   int8_t  trim;
@@ -49,11 +44,10 @@ struct __attribute__((packed)) SettingsPacket {
   uint8_t autoTaxiSpeed;
   uint8_t autoCircleSpeed;
 };
-static_assert(sizeof(SettingsPacket) == 8, "SettingsPacket size");
+static_assert(sizeof(SettingsPacket) == 7, "SettingsPacket size");
 
 struct __attribute__((packed)) TelemetryPacket {
-  uint8_t id0;
-  uint8_t id1;
+  uint8_t id;
   uint8_t mode;
   uint8_t battery;
   int16_t alt_dm;
@@ -61,7 +55,7 @@ struct __attribute__((packed)) TelemetryPacket {
   int16_t pitch_cd;
   int16_t roll_cd;
 };
-static_assert(sizeof(TelemetryPacket) == 12, "TelemetryPacket size");
+static_assert(sizeof(TelemetryPacket) == 11, "TelemetryPacket size");
 
 // ============================== Globals ======================================
 bool g_radioLinkActive = false;
@@ -145,8 +139,7 @@ static bool startTransmit(const uint8_t *data, size_t len) {
 
 static bool sendControlPacket() {
   ControlPacket pkt{};
-  pkt.id0 = kControlId0;
-  pkt.id1 = kControlId1;
+  pkt.id = kControlId;
   pkt.mode = g_desiredAirplaneMode;
   pkt.throttle = (uint8_t)lroundf(constrain(g_controlKnob1, 0.0f, 1.0f) * 255.0f);
   pkt.pitch    = (uint8_t)lroundf(constrain(g_controlJoyRY, 0.0f, 1.0f) * 255.0f);
@@ -156,8 +149,7 @@ static bool sendControlPacket() {
 
 static bool sendSettingsPacket() {
   SettingsPacket pkt{};
-  pkt.id0            = kSettingsId0;
-  pkt.id1            = kSettingsId1;
+  pkt.id             = kSettingsId;
   pkt.initialBattery = (uint8_t)getInitialBatteryPercent();
   pkt.responsiveness = (uint8_t)getResponsiveness();
   pkt.trim           = (int8_t)getTrim();
@@ -180,11 +172,11 @@ static void handleRx() {
   size_t len = sizeof(buffer);
   int16_t st = radio.readData(buffer, len);
   beginRx();
-  if (st != RADIOLIB_ERR_NONE || len < 2) return;
+  if (st != RADIOLIB_ERR_NONE || len < 1) return;
 
   if (len >= sizeof(TelemetryPacket)) {
     const TelemetryPacket *pkt = reinterpret_cast<const TelemetryPacket*>(buffer);
-    if (pkt->id0 == kTelemetryId0 && pkt->id1 == kTelemetryId1) {
+    if (pkt->id == kTelemetryId) {
       handleTelemetry(*pkt);
       s_rxCount++;
     }
