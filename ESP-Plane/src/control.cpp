@@ -367,7 +367,6 @@ void updateControl() {
             updateManualControl();
             break;
         case AIRPLANE_MODE_CIRCLE:
-        case AIRPLANE_MODE_AREA_SEARCH:
             updateAutonomousControl();
             break;
         default:

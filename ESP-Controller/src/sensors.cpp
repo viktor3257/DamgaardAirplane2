@@ -163,16 +163,16 @@ void readSensors()
     g_switch1 = (digitalRead(kSwitch1Pin) == LOW) ? 1 : 0;
     g_switch2 = (digitalRead(kSwitch2Pin) == LOW) ? 1 : 0;
 
-    // Update desired airplane mode based on button presses
+    // Update desired airplane mode based on button presses (1: neutral, 2: manual, 3: circle)
     if (g_button1Flag) {
         g_button1Flag = false;
-        g_desiredAirplaneMode = AIRPLANE_MODE_MANUAL;
+        g_desiredAirplaneMode = AIRPLANE_MODE_NEUTRAL;
     } else if (g_button2Flag) {
         g_button2Flag = false;
-        g_desiredAirplaneMode = AIRPLANE_MODE_CIRCLE;
+        g_desiredAirplaneMode = AIRPLANE_MODE_MANUAL;
     } else if (g_button3Flag) {
         g_button3Flag = false;
-        g_desiredAirplaneMode = AIRPLANE_MODE_AREA_SEARCH;
+        g_desiredAirplaneMode = AIRPLANE_MODE_CIRCLE;
     }
     // Switch 2 is handled by the display/menu system.
 }

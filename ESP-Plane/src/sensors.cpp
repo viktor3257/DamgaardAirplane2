@@ -25,11 +25,6 @@ double g_airplaneHomeLongitude = 0.0;
 double g_circleTargetLatitude = 55.847649;
 double g_circleTargetLongitude = 9.404065;
 
-double g_areaSearchRouteLat[kMaxAreaSearchPoints] = {0};
-double g_areaSearchRouteLon[kMaxAreaSearchPoints] = {0};
-uint16_t g_areaSearchRouteCount = 0;
-float g_areaSearchRouteAge = 0.0f;
-
 bool g_airplaneReceivesDataFromRaspberryPi = false;
 
 static Adafruit_BMP280 g_bmp;
@@ -70,34 +65,8 @@ static const unsigned long kPiGpsTimeout = 2000; // ms
 
 static char g_piBuf[128];
 static size_t g_piIdx = 0;
-static bool g_routeReceiving = false;
-static unsigned long g_routeReceivedTime = 0;
 
 static void parsePiLine(const char* line) {
-    if (strcmp(line, "ROUTE_START") == 0) {
-        g_routeReceiving = true;
-        g_areaSearchRouteCount = 0;
-        return;
-    }
-    if (strcmp(line, "ROUTE_END") == 0) {
-        g_routeReceiving = false;
-        g_routeReceivedTime = millis();
-        g_areaSearchRouteAge = 0.f;
-        return;
-    }
-
-    if (g_routeReceiving) {
-        if (g_areaSearchRouteCount < kMaxAreaSearchPoints) {
-            double lat = 0.0, lon = 0.0;
-            if (sscanf(line, "%lf,%lf", &lat, &lon) == 2) {
-                size_t idx = g_areaSearchRouteCount++;
-                g_areaSearchRouteLat[idx] = lat;
-                g_areaSearchRouteLon[idx] = lon;
-            }
-        }
-        return;
-    }
-
     double lat = 0.0, lon = 0.0;
     double tlat = 0.0, tlon = 0.0;
     double heading = 0.0;
@@ -172,11 +141,6 @@ static void readPiGps() {
             g_airplaneReceivesDataFromRaspberryPi = false;
             g_lastPiGpsTime = 0;
         }
-    }
-
-    if (g_routeReceivedTime != 0) {
-        unsigned long now = millis();
-        g_areaSearchRouteAge = (now - g_routeReceivedTime) / 1000.0f;
     }
 }
 
