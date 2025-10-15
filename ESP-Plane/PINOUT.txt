@@ -1,0 +1,49 @@
+ESP32 Controller – Pin Connections
+==========================================================
+GPIO 22  →  SCL								+
+GPIO 21  →  SDA								+
+GPIO 18  →  SCK								+
+GPIO 23  →  MOSI							+
+GPIO 19  →  MISO							+
+GPIO 5   →  CS		Core1262-868M					+
+GPIO 25  →  BUSY 	Core1262-868M					+
+GPIO 26  →  RESET	Core1262-868M					+
+GPIO 27  →  DIO1 	Core1262-868M					+
+GPIO 15  →  RXEN	Core1262-868M					+
+GPIO 34  →  Analogue in	Joystick X Hall					+
+GPIO 35  →  Analogue in	Joystick Y Hall					+
+GPIO 36  →  Analogue in	Potentiometer 1					+
+GPIO 39  →  Analogue in	Potentiometer 2					+
+GPIO 13  →  Digital in	Button 1 (pull-up)					+
+GPIO 14  →  Digital in	Button 2 (pull-up)					+
+GPIO 32  →  Digital in	Button 3 (pull-up)					+
+GPIO 33  →  Digital in	Button 4 (pull-up)					+
+GPIO 16  →  Digital in	Switch S1					+
+GPIO 17  →  Digital in	Switch S2					+
+
+ESP32 Plane - Pin Connections
+==========================================================
+GPIO 22  →  SCL       	BNO055 / BMP280 / MS4525DO			+
+GPIO 21  →  SDA      	BNO055 / BMP280 / MS4525DO			+
+GPIO 18  →  SCK       	Core1262-868M					+
+GPIO 23  →  MOSI       	Core1262-868M					+
+GPIO 19  →  MISO        Core1262-868M					+
+GPIO 5   →  CS          Core1262-868M					+
+GPI  34  →  DIO1 	Core1262-868M					+
+GPI  2  →  RESET	Core1262-868M					+
+GPI  35	 →  BUSY	Core1262-868M					+
+GPIO 4   →  RXEN	Core1262-868M					+
+GPIO 17  →  TX        	Pin 15 on Raspberry Pi Zero 2 W			+
+GPIO 16  →  RX        	Pin 14 on Raspberry Pi Zero 2 W			+
+GPIO 25  →  PWM out     Servo 1 					+
+GPIO 26  →  PWM out     Servo 2 					+
+GPIO 27  →  PWM out     Servo 3 					+
+GPIO 32  →  PWM out     Servo 4 					+
+GPIO 14  →  PWM out     Servo 5 					+
+GPIO 13  →  PWM out     Servo 6 					+
+GPIO 33  →  PWM out     ESC 						+
+GPIO 39  →  Analogue in ACS758 (Current sensor)				+
+
+
+
+
