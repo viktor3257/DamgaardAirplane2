@@ -182,7 +182,7 @@ static void handleRx() {
   beginRx();
   if (st != RADIOLIB_ERR_NONE || len < 2) return;
 
-  if (len == sizeof(TelemetryPacket)) {
+  if (len >= sizeof(TelemetryPacket)) {
     const TelemetryPacket *pkt = reinterpret_cast<const TelemetryPacket*>(buffer);
     if (pkt->id0 == kTelemetryId0 && pkt->id1 == kTelemetryId1) {
       handleTelemetry(*pkt);
