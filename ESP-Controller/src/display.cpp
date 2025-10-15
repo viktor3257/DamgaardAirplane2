@@ -145,18 +145,18 @@ static void printMainScreen() {
 }
 
 void updateDisplay() {
-    static int lastSwitch2State = -1;
-    int switch2State = g_switch2 ? 1 : 0;
+    static int lastSwitch1State = -1;
+    int switch1State = g_switch1 ? 1 : 0;
 
-    if (lastSwitch2State == -1) {
-        lastSwitch2State = switch2State;
-        if (switch2State) {
+    if (lastSwitch1State == -1) {
+        lastSwitch1State = switch1State;
+        if (switch1State) {
             g_prevValue = g_settingValues[g_selectedIndex];
             g_editValue = g_prevValue;
             g_editMode  = true;
         }
-    } else if (switch2State != lastSwitch2State) {
-        if (switch2State) {
+    } else if (switch1State != lastSwitch1State) {
+        if (switch1State) {
             g_prevValue = g_settingValues[g_selectedIndex];
             g_editValue = g_prevValue;
             g_editMode  = true;
@@ -166,7 +166,7 @@ void updateDisplay() {
             }
             g_editMode = false;
         }
-        lastSwitch2State = switch2State;
+        lastSwitch1State = switch1State;
         lcd.clear();
         memset(g_lastLines, 0, sizeof(g_lastLines));
     }
