@@ -3,7 +3,7 @@
 #include <Arduino.h>
 
 namespace {
-  bool logging_enabled = false;
+  bool logging_enabled = true;
 
   void tpValue(const char *name, double value) {
     Serial.print('>');
