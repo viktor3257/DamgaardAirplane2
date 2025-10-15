@@ -13,11 +13,11 @@ namespace {
   constexpr uint8_t kRadioSyncWord       = RADIOLIB_SX126X_SYNC_WORD_PUBLIC;
   constexpr int8_t  kRadioTxPowerDbm     = 10;
 
-  constexpr uint8_t kRadioCsPin          = 5;
-  constexpr uint8_t kRadioDio1Pin        = 27;
-  constexpr uint8_t kRadioResetPin       = 26;
-  constexpr uint8_t kRadioBusyPin        = 25;
-  constexpr uint8_t kRadioRxEnPin        = 15;
+  constexpr int kRadioCsPin          = 5;
+  constexpr int kRadioDio1Pin        = 27;
+  constexpr int kRadioResetPin       = 26;
+  constexpr int kRadioBusyPin        = 25;
+  constexpr int kRadioRfSwitchPin    = 15;
 
   Module g_radio_module(kRadioCsPin, kRadioDio1Pin, kRadioResetPin, kRadioBusyPin);
   SX1262 g_radio(&g_radio_module);
@@ -29,7 +29,10 @@ namespace {
       return true;
     }
 
-    g_radio_module.setRfSwitchPins(kRadioRxEnPin, kRadioRxEnPin);
+    // The RF switch is wired to a single GPIO on the controller side. A HIGH
+    // level enables RX and a LOW level enables TX, so configure RadioLib to
+    // drive the same pin for both roles.
+    g_radio_module.setRfSwitchPins(kRadioRfSwitchPin, kRadioRfSwitchPin);
 
     const int16_t state = g_radio.begin(kRadioFrequencyMHz,
                                         kRadioBandwidthKHz,
