@@ -145,15 +145,28 @@ static void printMainScreen() {
 }
 
 void updateDisplay() {
-    if (button4Pressed()) {
-        if (g_editMode) {
-            // Confirm the edit
-            g_settingValues[g_selectedIndex] = g_editValue;
-        } else {
+    static int lastSwitch2State = -1;
+    int switch2State = g_switch2 ? 1 : 0;
+
+    if (lastSwitch2State == -1) {
+        lastSwitch2State = switch2State;
+        if (switch2State) {
             g_prevValue = g_settingValues[g_selectedIndex];
             g_editValue = g_prevValue;
+            g_editMode  = true;
         }
-        g_editMode = !g_editMode;
+    } else if (switch2State != lastSwitch2State) {
+        if (switch2State) {
+            g_prevValue = g_settingValues[g_selectedIndex];
+            g_editValue = g_prevValue;
+            g_editMode  = true;
+        } else {
+            if (g_editMode) {
+                g_settingValues[g_selectedIndex] = g_editValue;
+            }
+            g_editMode = false;
+        }
+        lastSwitch2State = switch2State;
         lcd.clear();
         memset(g_lastLines, 0, sizeof(g_lastLines));
     }
