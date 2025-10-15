@@ -57,7 +57,6 @@ void printPlaneDebugInfo() {
 
     tpValue("Plane_RecController", g_airplaneReceivesDataFromController);
     tpValue("Plane_RecPi", g_airplaneReceivesDataFromRaspberryPi);
-    tpValue("Plane_RouteAgeS", g_areaSearchRouteAge);
     tpValue("Plane_RadioTxPerSec", g_radioTxPerSec);
     tpValue("Plane_RadioRxPerSec", g_radioRxPerSec);
 

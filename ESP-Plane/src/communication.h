@@ -6,8 +6,7 @@
 enum AirplaneMode {
     AIRPLANE_MODE_NEUTRAL = 0,
     AIRPLANE_MODE_MANUAL = 1,
-    AIRPLANE_MODE_CIRCLE = 2,
-    AIRPLANE_MODE_AREA_SEARCH = 3
+    AIRPLANE_MODE_CIRCLE = 2
 };
 
 enum PacketType {

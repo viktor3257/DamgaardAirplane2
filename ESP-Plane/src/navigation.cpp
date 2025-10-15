@@ -91,76 +91,6 @@ static void navigateCircle() {
     g_desiredSpeed = currentlyCircling ? circleSpeedMps : taxiSpeedMps;
 }
 
-static void navigateAreaSearch() {
-    static uint16_t areaIdx = 0;
-    static float lastRouteAge = -1.f;
-
-    if (g_areaSearchRouteAge < lastRouteAge) {
-        areaIdx = 0;  // new route loaded
-    }
-    lastRouteAge = g_areaSearchRouteAge;
-
-    uint16_t count = g_areaSearchRouteCount;
-    float desiredHeading = g_airplaneHeading;
-
-    if (count != 0) {
-        if (areaIdx >= count) {
-            areaIdx = 0;
-        }
-
-        double tgtLat = g_areaSearchRouteLat[areaIdx];
-        double tgtLon = g_areaSearchRouteLon[areaIdx];
-
-        auto distanceMeters = [](double lat1, double lon1,
-                                 double lat2, double lon2) {
-            double dLat = deg2rad(lat2 - lat1);
-            double dLon = deg2rad(lon2 - lon1);
-            double lat1r = deg2rad(lat1);
-            double lat2r = deg2rad(lat2);
-            double a = sin(dLat * 0.5) * sin(dLat * 0.5) +
-                       cos(lat1r) * cos(lat2r) *
-                       sin(dLon * 0.5) * sin(dLon * 0.5);
-            double c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
-            return static_cast<float>(kEarthRadius * c);
-        };
-
-        auto bearingDegrees = [](double lat1, double lon1,
-                                 double lat2, double lon2) {
-            double lat1r = deg2rad(lat1);
-            double lat2r = deg2rad(lat2);
-            double dLon = deg2rad(lon2 - lon1);
-            double y = sin(dLon) * cos(lat2r);
-            double x = cos(lat1r) * sin(lat2r) -
-                       sin(lat1r) * cos(lat2r) * cos(dLon);
-            double brng = atan2(y, x);
-            float heading = rad2deg(brng);
-            if (heading < 0.0f)
-                heading += 360.0f;
-            return heading;
-        };
-
-        float dist = distanceMeters(g_airplaneLatitude,
-                                   g_airplaneLongitude,
-                                   tgtLat, tgtLon);
-        if (dist < 20.0f) {
-            areaIdx++;
-            if (areaIdx >= count)
-                areaIdx = 0;
-            tgtLat = g_areaSearchRouteLat[areaIdx];
-            tgtLon = g_areaSearchRouteLon[areaIdx];
-        }
-
-        desiredHeading = bearingDegrees(g_airplaneLatitude,
-                                        g_airplaneLongitude,
-                                        tgtLat, tgtLon);
-    }
-
-    g_desiredHeading = desiredHeading;
-    g_desiredAltitude = static_cast<float>(g_settingAutoAltitude);
-    g_desiredSpeed    = static_cast<float>(g_settingAutoTaxiSpeed) / 3.6f;
-}
-
-
 void initNavigation() {
     // Setup navigation algorithms
 }
@@ -168,7 +98,5 @@ void initNavigation() {
 void updateNavigation() {
     if (g_airplaneMode == AIRPLANE_MODE_CIRCLE) {
         navigateCircle();
-    } else if (g_airplaneMode == AIRPLANE_MODE_AREA_SEARCH) {
-        navigateAreaSearch();
     }
 }
