@@ -339,13 +339,21 @@ async def website_poller(state: RuntimeState, uart_tx_q: asyncio.Queue, cfg: Con
 # ---------------------------
 # Stream manager
 # ---------------------------
+
+# ---------------------------
+# Stream manager (hardened)
+# ---------------------------
 async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logger):
     """
     Start/stop YouTube stream based on state.stream_enabled.
-    rpicam-vid (H.264) --nopreview -> ffmpeg (copy video + silent AAC) -> RTMP
+    rpicam-vid (H.264) -> ffmpeg (copy video + AAC) -> RTMP
     and a periodic JPEG snapshot for the vision loop.
+    Captures child stderr; backs off on repeated failures.
     """
+    import threading
+    import shutil
     import time
+    import subprocess
 
     cam_bin = shutil.which("rpicam-vid")
     if not cam_bin:
@@ -366,35 +374,37 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
         "--framerate", str(cfg.cam_fps),
         "--rotation", str(cfg.cam_rotation_deg),
         "--bitrate", str(cfg.cam_bitrate_kbps * 1000),
-        "--intra", str(cfg.cam_fps * 2),   # ~2s keyframe interval
+        "--intra", str(cfg.cam_fps * 2),
         "-t", "0",
-        "-o", "-",                          # H.264 to stdout
+        "-o", "-",
     ]
 
-    # ensure snapshot dir exists
     cfg.snap_dir.mkdir(parents=True, exist_ok=True)
     snap_path = str(cfg.snap_dir / cfg.snap_name)
 
-    # RTMP + periodic JPEG (second output). The JPEG is overwritten in-place.
     ffmpeg_cmd = [
         "ffmpeg",
-        "-re",
+        "-hide_banner", "-loglevel", "warning",
+
+        # input 0: silent audio (keeps YT happy)
         "-thread_queue_size", "1024",
         "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+
+        # input 1: h264 elementary stream from rpicam-vid
         "-thread_queue_size", "1024",
         "-fflags", "+genpts",
         "-use_wallclock_as_timestamps", "1",
-        "-i", "pipe:0",  # video from rpicam-vid
+        "-i", "pipe:0",
 
-        # --- Output #1: RTMP stream (video copy + AAC) ---
+        # Output #1: RTMP (video copy + AAC)
         "-map", "0:a", "-map", "1:v",
         "-c:v", "copy",
         "-c:a", "aac", "-b:a", "128k",
-        "-f", "flv", f"{cfg.rtmp_url}/{cfg.rtmp_key}",
+        "-f", "flv", "-rtmp_live", "live", f"{cfg.rtmp_url}/{cfg.rtmp_key}",
 
-        # --- Output #2: periodic JPEG snapshot (every ~5s) ---
+        # Output #2: periodic JPEG snapshot
         "-map", "1:v",
-        "-vf", "fps=1/5,scale=640:-1",  # adjust cadence/size if you want
+        "-vf", "fps=1/5,scale=640:-1",
         "-c:v", "mjpeg",
         "-q:v", "5",
         "-f", "image2",
@@ -405,6 +415,16 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
     cam_proc = None
     ffmpeg_proc = None
     running = False
+    backoff_s = 1.0
+
+    def _pump_stderr(pipe, tag):
+        try:
+            for line in iter(pipe.readline, b""):
+                txt = line.decode("utf-8", "ignore").strip()
+                if txt:
+                    logger.warning(f"{tag}: {txt}")
+        except Exception:
+            pass
 
     def start_pipeline():
         nonlocal cam_proc, ffmpeg_proc, running
@@ -414,32 +434,26 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
             cam_proc = subprocess.Popen(
                 cam_cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 bufsize=0
             )
             ffmpeg_proc = subprocess.Popen(
                 ffmpeg_cmd,
                 stdin=cam_proc.stdout,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
+                stderr=subprocess.PIPE,
+                bufsize=0
             )
+
+            # stderr readers
+            threading.Thread(target=_pump_stderr, args=(cam_proc.stderr, "[rpicam-vid]"), daemon=True).start()
+            threading.Thread(target=_pump_stderr, args=(ffmpeg_proc.stderr, "[ffmpeg]"), daemon=True).start()
+
             running = True
             logger.info("[STREAM] started (rpicam-vid → ffmpeg → RTMP + JPEG)")
         except Exception as e:
             logger.info(f"[STREAM] failed to start: {e}")
-            try:
-                if ffmpeg_proc and ffmpeg_proc.poll() is None:
-                    ffmpeg_proc.terminate()
-            except Exception:
-                pass
-            try:
-                if cam_proc and cam_proc.poll() is None:
-                    cam_proc.terminate()
-            except Exception:
-                pass
-            cam_proc = None
-            ffmpeg_proc = None
-            running = False
+            stop_pipeline()
 
     def stop_pipeline():
         nonlocal cam_proc, ffmpeg_proc, running
@@ -452,7 +466,7 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
                     p.terminate()
             except Exception:
                 pass
-        time.sleep(0.4)
+        time.sleep(0.5)
         for p in (ffmpeg_proc, cam_proc):
             try:
                 if p and p.poll() is None:
@@ -467,6 +481,7 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
             await asyncio.sleep(0.25)
             if state.stream_enabled and not running:
                 start_pipeline()
+                backoff_s = 1.0  # reset backoff after a clean start
             elif not state.stream_enabled and running:
                 stop_pipeline()
 
@@ -479,12 +494,17 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
                         dead = True
                 except Exception:
                     dead = True
+
                 if dead:
-                    logger.info("[STREAM] pipeline exited; restarting")
+                    logger.info(f"[STREAM] pipeline exited; restarting in {backoff_s:.1f}s")
                     stop_pipeline()
+                    # Exponential backoff up to 30s to avoid thrash if RTMP/DNS is down
+                    await asyncio.sleep(backoff_s)
+                    backoff_s = min(backoff_s * 2, 30.0)
                     start_pipeline()
     finally:
         stop_pipeline()
+
 
 # ---------------------------
 # CSV logger
