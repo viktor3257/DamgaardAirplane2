@@ -7,9 +7,10 @@ Components:
 - ESP32 telemetry simulator (until real UART is wired)
 - Web poster (POSTs location/telemetry to your API)
 - Website poller (stream-state, circling-point, search-status)
-- Stream state manager
+- Stream state manager (RTMP + periodic JPEG snapshot for vision)
 - CSV logger
-- Visual search loop using OpenAi API (snapshot every ~5s, detect object, post hit)
+- Visual search loop using OpenAI API (reads JPEG from stream when available,
+  falls back to still capture when stream is off)
 """
 
 import os
@@ -19,7 +20,6 @@ import time
 import json
 import math
 import signal
-import random
 import asyncio
 import logging
 import subprocess
@@ -30,7 +30,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Optional
-
 
 # ---------------------------
 # Configuration
@@ -78,15 +77,13 @@ class Config:
 class DetectConfig:
     enabled: bool = False
     query: str = ""
-    period_s: float = 5.0         # snapshot/sample cadence
-    min_conf: float = 0.5         # accept at/above this confidence
+    period_s: float = 5.0         # sample cadence
     confirmations: int = 1        # consecutive positives required
 
 @dataclass
 class DetectState:
     local_search_locked: bool = False  # set True after a hit; cleared when website disables search
     consecutive_positives: int = 0
-    last_confidence: float = 0.0
     last_error: str = ""
 
 # ---------------------------
@@ -129,7 +126,7 @@ class RuntimeState:
     latest_esp32: Telemetry = field(default_factory=Telemetry)
     shutting_down: bool = False
 
-    # NEW: visual search
+    # Visual search
     detect_cfg: DetectConfig = field(default_factory=DetectConfig)
     detect_state: DetectState = field(default_factory=DetectState)
 
@@ -137,15 +134,7 @@ class RuntimeState:
 # GPS (SIM7600G-H via NMEA)
 # ---------------------------
 async def gps_reader(state: RuntimeState, cfg: Config, logger: logging.Logger):
-    """
-    Read NMEA sentences from SIM7600G-H and update:
-      - state.latest_gps.lat / lon / time_utc / fix_ok
-      - state.latest_esp32.groundspeed_ms (from RMC/VTG)
-      - state.latest_esp32.yaw_deg (course/heading from RMC/VTG)
-    Notes:
-      - NMEA is often on /dev/ttyUSB1; AT commands on /dev/ttyUSB2.
-      - Tries to power GNSS once via AT; continues even if that fails.
-    """
+    """Read NMEA sentences and update GPS/telemetry speed/heading."""
     import serial  # local import keeps import errors isolated
 
     nmea_port = "/dev/ttyUSB1"  # change if your NMEA port differs
@@ -172,7 +161,6 @@ async def gps_reader(state: RuntimeState, cfg: Config, logger: logging.Logger):
 
     logger.info(f"[SIM7600] NMEA on {nmea_port} started")
 
-    # Inline converters
     def nmea_deg(dm, hemi):
         try:
             v = float(dm)
@@ -241,7 +229,6 @@ async def gps_reader(state: RuntimeState, cfg: Config, logger: logging.Logger):
 # ---------------------------
 # ESP32 telemetry (simulated)
 # ---------------------------
-
 async def esp32_uart_rx(state: RuntimeState, cfg: Config, logger: logging.Logger):
     t0 = time.time()
     while not state.shutting_down:
@@ -282,7 +269,7 @@ async def website_poller(state: RuntimeState, uart_tx_q: asyncio.Queue, cfg: Con
     Poll every cfg.poll_period_s:
       - GET /api/stream-state -> update stream_enabled
       - GET /api/circling-point -> set target_points and send a TARGETS:lat,lon line on change
-      - (NEW) GET /api/search-status -> update visual search config (enabled/query)
+      - GET /api/search-status -> update visual search config (enabled/query)
     """
     base = "https://studio--sky-pointer.us-central1.hosted.app"
     period = cfg.poll_period_s
@@ -355,14 +342,10 @@ async def website_poller(state: RuntimeState, uart_tx_q: asyncio.Queue, cfg: Con
 async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logger):
     """
     Start/stop YouTube stream based on state.stream_enabled.
-    rpicam-vid (H.264) --nopreview -> ffmpeg (copy video + silent AAC) -> RTMP.
-
-    NOTE: The visual search uses rpicam-still/libcamera-still for snapshots.
-    When streaming is ON, the camera is occupied; snapshot capture may fail.
-    (If you want snapshots during streaming, extend this to add an ffmpeg
-     branch that writes a JPEG every N seconds.)
+    rpicam-vid (H.264) --nopreview -> ffmpeg (copy video + silent AAC) -> RTMP
+    and a periodic JPEG snapshot for the vision loop.
     """
-    import subprocess, time, shutil
+    import time
 
     cam_bin = shutil.which("rpicam-vid")
     if not cam_bin:
@@ -388,7 +371,11 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
         "-o", "-",                          # H.264 to stdout
     ]
 
-    # Add a silent audio source; some YouTube ingest paths prefer A/V
+    # ensure snapshot dir exists
+    cfg.snap_dir.mkdir(parents=True, exist_ok=True)
+    snap_path = str(cfg.snap_dir / cfg.snap_name)
+
+    # RTMP + periodic JPEG (second output). The JPEG is overwritten in-place.
     ffmpeg_cmd = [
         "ffmpeg",
         "-re",
@@ -397,11 +384,22 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
         "-thread_queue_size", "1024",
         "-fflags", "+genpts",
         "-use_wallclock_as_timestamps", "1",
-        "-i", "pipe:0",                    # video from rpicam-vid
-        "-c:v", "copy",                    # copy H.264 (no re-encode)
+        "-i", "pipe:0",  # video from rpicam-vid
+
+        # --- Output #1: RTMP stream (video copy + AAC) ---
+        "-map", "0:a", "-map", "1:v",
+        "-c:v", "copy",
         "-c:a", "aac", "-b:a", "128k",
-        "-f", "flv",
-        f"{cfg.rtmp_url}/{cfg.rtmp_key}",
+        "-f", "flv", f"{cfg.rtmp_url}/{cfg.rtmp_key}",
+
+        # --- Output #2: periodic JPEG snapshot (every ~5s) ---
+        "-map", "1:v",
+        "-vf", "fps=1/5,scale=640:-1",  # adjust cadence/size if you want
+        "-c:v", "mjpeg",
+        "-q:v", "5",
+        "-f", "image2",
+        "-update", "1",
+        snap_path,
     ]
 
     cam_proc = None
@@ -426,7 +424,7 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
                 stderr=subprocess.DEVNULL
             )
             running = True
-            logger.info("[STREAM] started (rpicam-vid → ffmpeg → RTMP)")
+            logger.info("[STREAM] started (rpicam-vid → ffmpeg → RTMP + JPEG)")
         except Exception as e:
             logger.info(f"[STREAM] failed to start: {e}")
             try:
@@ -613,18 +611,16 @@ async def web_poster(state: RuntimeState, cfg: Config, logger: logging.Logger):
                 logger.info(f"[POST] failed: {e}")
 
 # ---------------------------
-# Visual search 
+# Visual search
 # ---------------------------
 async def visual_search_loop(state: RuntimeState, cfg: Config, logger: logging.Logger):
     """
     Every detect_cfg.period_s:
-      - capture JPEG (rpicam-still/libcamera-still)
-      - ask OpenAI if the image contains `detect_cfg.query`
-      - model must answer strictly 'True' or 'False'
-      - when `confirmations` consecutive True -> post GPS + image and lock locally
+      - If stream is ON: read JPEG written by ffmpeg (no camera contention)
+      - Else: still-capture (rpicam-still/libcamera-still) if available
+      - Ask OpenAI if the image contains `detect_cfg.query` (strict True/False)
+      - On `confirmations` consecutive True -> post GPS + image and lock locally
     """
-    import asyncio, base64, os, shutil, math
-    from datetime import datetime
     from aiohttp import ClientSession, ClientTimeout
 
     logger.info("[DETECT] visual search loop started")
@@ -633,16 +629,15 @@ async def visual_search_loop(state: RuntimeState, cfg: Config, logger: logging.L
     OPENAI_URL  = "https://api.openai.com/v1/chat/completions"
     SERVER_BASE = "https://studio--sky-pointer.us-central1.hosted.app"
 
-    # Resolve camera tool once
+    # Still-capture tool is optional (only required when stream is OFF)
     tool = shutil.which("rpicam-still") or shutil.which("libcamera-still")
     if not tool:
-        logger.info("[DETECT] no snapshot tool found (install rpicam-apps/libcamera-still).")
-        return
+        logger.info("[DETECT] no still-capture tool found. Will use stream snapshots when available.")
 
     # Resolve API key once
     api_key = cfg.openai_api_key
     if not api_key:
-        logger.info("[OPENAI] missing API key (cfg.openai_api_key or env OPENAI_API_KEY).")
+        logger.error("[OPENAI] missing API key (OPENAI_API_KEY).")
         return
     openai_headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     json_headers   = {"Content-Type": "application/json"}
@@ -662,27 +657,50 @@ async def visual_search_loop(state: RuntimeState, cfg: Config, logger: logging.L
             if ds.local_search_locked:
                 continue
 
-            # ---- Snapshot ----
-            tmp = cfg.snap_dir / (cfg.snap_name + ".tmp")
-            out = cfg.snap_dir / cfg.snap_name
-            cmd = [
-                tool, "-n", "-t", "1",
-                "--width", str(max(cfg.cam_width, 640)),
-                "--height", str(max(cfg.cam_height, 360)),
-                "--rotation", str(cfg.cam_rotation_deg),
-                "-q", "85", "-o", str(tmp),
-            ]
-            try:
-                p = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-                )
-                await asyncio.wait_for(p.wait(), timeout=6.0)
-                if p.returncode != 0 or not tmp.exists():
+            # ---- Snapshot (hybrid) ----
+            img = None
+            snap_file = cfg.snap_dir / cfg.snap_name
+
+            if state.stream_enabled and snap_file.exists():
+                # Read latest frame from ffmpeg only when updated
+                last_mt = getattr(visual_search_loop, "_last_mt", 0.0)
+                try:
+                    cur_mt = snap_file.stat().st_mtime
+                    if cur_mt <= last_mt:
+                        continue  # no new frame yet
+                    img = snap_file.read_bytes()
+                    visual_search_loop._last_mt = cur_mt
+                except Exception as e:
+                    logger.debug(f"[DETECT] stream snapshot read failed: {e}")
                     continue
-                tmp.replace(out)
-                img = out.read_bytes()
-            except Exception as e:
-                logger.debug(f"[DETECT] snapshot error/timeout: {e}")
+            else:
+                # Fallback to direct still capture when stream is OFF (or no file yet)
+                if not tool:
+                    # No tool available — wait for stream to provide a frame
+                    continue
+                tmp = cfg.snap_dir / (cfg.snap_name + ".tmp")
+                out = cfg.snap_dir / cfg.snap_name
+                cmd = [
+                    tool, "-n", "-t", "1",
+                    "--width", str(max(cfg.cam_width, 640)),
+                    "--height", str(max(cfg.cam_height, 360)),
+                    "--rotation", str(cfg.cam_rotation_deg),
+                    "-q", "85", "-o", str(tmp),
+                ]
+                try:
+                    pcap = await asyncio.create_subprocess_exec(
+                        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                    )
+                    await asyncio.wait_for(pcap.wait(), timeout=6.0)
+                    if pcap.returncode != 0 or not tmp.exists():
+                        continue
+                    tmp.replace(out)
+                    img = out.read_bytes()
+                except Exception as e:
+                    logger.debug(f"[DETECT] still snapshot error/timeout: {e}")
+                    continue
+
+            if not img:
                 continue
 
             # ---- Ask OpenAI for strict True/False ----
@@ -710,7 +728,6 @@ async def visual_search_loop(state: RuntimeState, cfg: Config, logger: logging.L
                 raw = (data.get("choices", [{}])[0]
                           .get("message", {})
                           .get("content", "") or "").strip().lower()
-                # Robust to yes/no, but we expect exactly true/false
                 present = raw.startswith("true") or raw.startswith("yes")
             except Exception as e:
                 logger.info(f"[OPENAI] error: {e}")
@@ -792,8 +809,7 @@ async def main_async():
         (5.0, lambda: asyncio.create_task(gps_reader(state, cfg, logger))),
         (3.0, lambda: asyncio.create_task(file_logger(state, cfg, logger))),
         (1.0, lambda: asyncio.create_task(website_poller(state, uart_tx_q, cfg, logger))),
-        # NEW: visual search loop (after website_poller so config is ready)
-        (0.8, lambda: asyncio.create_task(visual_search_loop(state, cfg, logger))),
+        (0.8, lambda: asyncio.create_task(visual_search_loop(state, cfg, logger))),  # after poller
         (0.5, lambda: asyncio.create_task(web_poster(state, cfg, logger))),
         (0.5, lambda: asyncio.create_task(esp32_uart_rx(state, cfg, logger))),
         (0.5, lambda: asyncio.create_task(esp32_uart_tx(uart_tx_q, state, cfg, logger))),
