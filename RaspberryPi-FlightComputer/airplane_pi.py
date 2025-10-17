@@ -71,7 +71,7 @@ class Config:
     snap_name: str = "snap_latest.jpg"
 
     # OpenAI (vision)
-    openai_api_key: str = "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"
+    openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", "").strip())
     openai_model: str = "gpt-4o-mini"  # vision-capable & fast
 
 @dataclass
@@ -640,7 +640,7 @@ async def visual_search_loop(state: RuntimeState, cfg: Config, logger: logging.L
         return
 
     # Resolve API key once
-    api_key = cfg.openai_api_key.strip()
+    api_key = cfg.openai_api_key
     if not api_key:
         logger.info("[OPENAI] missing API key (cfg.openai_api_key or env OPENAI_API_KEY).")
         return

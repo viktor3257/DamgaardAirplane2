@@ -9,6 +9,10 @@ Type=simple
 User=viktor
 WorkingDirectory=/home/viktor/Projects/DamgaardAirplane2/RaspberryPi-FlightComputer
 
+# <-- this line makes /etc/airplane.env available to your app -->
+EnvironmentFile=/etc/airplane.env
+Environment=PYTHONUNBUFFERED=1
+
 # Pre-start: update repo and reload units if the service file changed
 ExecStartPre=/bin/bash -lc '\
   set -euo pipefail; \
@@ -21,9 +25,12 @@ ExecStartPre=/bin/bash -lc '\
 '
 
 # Start your app
-ExecStart=/usr/bin/env python3 /home/viktor/Projects/DamgaardAirplane2/RaspberryPi-FlightComputer/airplane_pi.py
+ExecStart=/usr/bin/python3 /home/viktor/Projects/DamgaardAirplane2/RaspberryPi-FlightComputer/airplane_pi.py
+
 Restart=always
 RestartSec=3
+# Optional hardening:
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
