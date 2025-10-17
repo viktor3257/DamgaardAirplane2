@@ -71,7 +71,7 @@ class Config:
     snap_name: str = "snap_latest.jpg"
 
     # OpenAI (vision)
-    openai_api_key: str = "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")
+    openai_api_key: str = "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"
     openai_model: str = "gpt-4o-mini"  # vision-capable & fast
 
 @dataclass
