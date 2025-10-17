@@ -6,10 +6,10 @@ Components:
 - GPS reader (SIM7600G-H NMEA → lat/lon, heading, ground speed)
 - ESP32 telemetry simulator (until real UART is wired)
 - Web poster (POSTs location/telemetry to your API)
-- Website poller (stream-state, circling-point)
+- Website poller (stream-state, circling-point, search-status)
 - Stream state manager
-- CSV logger 
-
+- CSV logger
+- Visual search loop using OpenAi API (snapshot every ~5s, detect object, post hit)
 """
 
 import os
@@ -24,6 +24,8 @@ import asyncio
 import logging
 import subprocess
 import aiohttp
+import base64
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -64,7 +66,28 @@ class Config:
     cam_rotation_deg: int = 180   # 180 to flip image
     cam_bitrate_kbps: int = 3500  # tune if needed
 
+    # Snapshots for visual search
+    snap_dir: Path = BASE_DIR / "snaps"
+    snap_name: str = "snap_latest.jpg"
 
+    # OpenAI (vision)
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "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")
+    openai_model: str = "gpt-4o-mini"  # vision-capable & fast
+
+@dataclass
+class DetectConfig:
+    enabled: bool = False
+    query: str = ""
+    period_s: float = 5.0         # snapshot/sample cadence
+    min_conf: float = 0.5         # accept at/above this confidence
+    confirmations: int = 1        # consecutive positives required
+
+@dataclass
+class DetectState:
+    local_search_locked: bool = False  # set True after a hit; cleared when website disables search
+    consecutive_positives: int = 0
+    last_confidence: float = 0.0
+    last_error: str = ""
 
 # ---------------------------
 # Data models
@@ -106,6 +129,9 @@ class RuntimeState:
     latest_esp32: Telemetry = field(default_factory=Telemetry)
     shutting_down: bool = False
 
+    # NEW: visual search
+    detect_cfg: DetectConfig = field(default_factory=DetectConfig)
+    detect_state: DetectState = field(default_factory=DetectState)
 
 # ---------------------------
 # GPS (SIM7600G-H via NMEA)
@@ -215,6 +241,7 @@ async def gps_reader(state: RuntimeState, cfg: Config, logger: logging.Logger):
 # ---------------------------
 # ESP32 telemetry (simulated)
 # ---------------------------
+
 async def esp32_uart_rx(state: RuntimeState, cfg: Config, logger: logging.Logger):
     t0 = time.time()
     while not state.shutting_down:
@@ -255,6 +282,7 @@ async def website_poller(state: RuntimeState, uart_tx_q: asyncio.Queue, cfg: Con
     Poll every cfg.poll_period_s:
       - GET /api/stream-state -> update stream_enabled
       - GET /api/circling-point -> set target_points and send a TARGETS:lat,lon line on change
+      - (NEW) GET /api/search-status -> update visual search config (enabled/query)
     """
     base = "https://studio--sky-pointer.us-central1.hosted.app"
     period = cfg.poll_period_s
@@ -299,6 +327,28 @@ async def website_poller(state: RuntimeState, uart_tx_q: asyncio.Queue, cfg: Con
             except Exception as e:
                 logger.info(f"[API] circling-point failed: {e}")
 
+            # object search status
+            try:
+                resp = await session.get(base + "/api/search-status")
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    is_searching = bool(data.get("isSearching", False))
+                    query = str(data.get("query", "") or "")
+
+                    dc = state.detect_cfg
+                    prev_enabled = dc.enabled
+                    dc.enabled = is_searching and len(query.strip()) > 0
+                    dc.query = query.strip()
+
+                    # If website turned OFF, clear local lock & streak
+                    if prev_enabled and not dc.enabled:
+                        state.detect_state.local_search_locked = False
+                        state.detect_state.consecutive_positives = 0
+                else:
+                    logger.info(f"[API] search-status HTTP {resp.status}")
+            except Exception as e:
+                logger.info(f"[API] search-status failed: {e}")
+
 # ---------------------------
 # Stream manager
 # ---------------------------
@@ -306,6 +356,11 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
     """
     Start/stop YouTube stream based on state.stream_enabled.
     rpicam-vid (H.264) --nopreview -> ffmpeg (copy video + silent AAC) -> RTMP.
+
+    NOTE: The visual search uses rpicam-still/libcamera-still for snapshots.
+    When streaming is ON, the camera is occupied; snapshot capture may fail.
+    (If you want snapshots during streaming, extend this to add an ffmpeg
+     branch that writes a JPEG every N seconds.)
     """
     import subprocess, time, shutil
 
@@ -442,7 +497,7 @@ async def file_logger(state: RuntimeState, cfg: Config, logger: logging.Logger):
       - Rename previous flight to local (UTC+2) 'YYYY-mm-dd_HH-MM.csv'
       - git add/commit/push; delete the file locally if push succeeds
     Then:
-      - Create 'flight_YYYYmmdd_HHMM.csv' for this boot and append rows
+      - Create 'flight_YYYYmmdd_%H%M.csv' for this boot and append rows
     """
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -520,7 +575,7 @@ async def file_logger(state: RuntimeState, cfg: Config, logger: logging.Logger):
         f.close()
 
 # ---------------------------
-# Web poster
+# Web poster (telemetry)
 # ---------------------------
 async def web_poster(state: RuntimeState, cfg: Config, logger: logging.Logger):
     url = "https://studio--sky-pointer.us-central1.hosted.app/api/drone-location"
@@ -558,6 +613,145 @@ async def web_poster(state: RuntimeState, cfg: Config, logger: logging.Logger):
                 logger.info(f"[POST] failed: {e}")
 
 # ---------------------------
+# Visual search 
+# ---------------------------
+async def visual_search_loop(state: RuntimeState, cfg: Config, logger: logging.Logger):
+    """
+    Every detect_cfg.period_s:
+      - capture JPEG (rpicam-still/libcamera-still)
+      - ask OpenAI if the image contains `detect_cfg.query`
+      - model must answer strictly 'True' or 'False'
+      - when `confirmations` consecutive True -> post GPS + image and lock locally
+    """
+    import asyncio, base64, os, shutil, math
+    from datetime import datetime
+    from aiohttp import ClientSession, ClientTimeout
+
+    logger.info("[DETECT] visual search loop started")
+    cfg.snap_dir.mkdir(parents=True, exist_ok=True)
+
+    OPENAI_URL  = "https://api.openai.com/v1/chat/completions"
+    SERVER_BASE = "https://studio--sky-pointer.us-central1.hosted.app"
+
+    # Resolve camera tool once
+    tool = shutil.which("rpicam-still") or shutil.which("libcamera-still")
+    if not tool:
+        logger.info("[DETECT] no snapshot tool found (install rpicam-apps/libcamera-still).")
+        return
+
+    # Resolve API key once
+    api_key = (getattr(cfg, "openai_api_key", "") or os.getenv("OPENAI_API_KEY", "")).strip()
+    if not api_key:
+        logger.info("[OPENAI] missing API key (cfg.openai_api_key or env OPENAI_API_KEY).")
+        return
+    openai_headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    json_headers   = {"Content-Type": "application/json"}
+
+    # Reuse HTTP sessions
+    async with ClientSession(timeout=ClientTimeout(total=12), headers=openai_headers) as s_ai, \
+               ClientSession(timeout=ClientTimeout(total=10)) as s_srv:
+
+        while not state.shutting_down:
+            await asyncio.sleep(max(1.0, float(getattr(state.detect_cfg, "period_s", 5.0))))
+
+            dc, ds = state.detect_cfg, state.detect_state
+            if not dc.enabled:
+                ds.local_search_locked = False
+                ds.consecutive_positives = 0
+                continue
+            if ds.local_search_locked:
+                continue
+
+            # ---- Snapshot ----
+            tmp = cfg.snap_dir / (cfg.snap_name + ".tmp")
+            out = cfg.snap_dir / cfg.snap_name
+            cmd = [
+                tool, "-n", "-t", "1",
+                "--width", str(max(cfg.cam_width, 640)),
+                "--height", str(max(cfg.cam_height, 360)),
+                "--rotation", str(cfg.cam_rotation_deg),
+                "-q", "85", "-o", str(tmp),
+            ]
+            try:
+                p = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                )
+                await asyncio.wait_for(p.wait(), timeout=6.0)
+                if p.returncode != 0 or not tmp.exists():
+                    continue
+                tmp.replace(out)
+                img = out.read_bytes()
+            except Exception as e:
+                logger.debug(f"[DETECT] snapshot error/timeout: {e}")
+                continue
+
+            # ---- Ask OpenAI for strict True/False ----
+            data_uri = "data:image/jpeg;base64," + base64.b64encode(img).decode("ascii")
+            body = {
+                "model": getattr(cfg, "openai_model", "gpt-4o-mini"),
+                "temperature": 0,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text",
+                         "text": f"Does this photo contain '{dc.query}'? "
+                                 "Answer strictly 'True' or 'False' with no other text."},
+                        {"type": "image_url", "image_url": {"url": data_uri}},
+                    ],
+                }],
+            }
+
+            try:
+                async with s_ai.post(OPENAI_URL, json=body) as r:
+                    if r.status >= 400:
+                        logger.info(f"[OPENAI] HTTP {r.status}: {(await r.text())[:200]}")
+                        continue
+                    data = await r.json()
+                raw = (data.get("choices", [{}])[0]
+                          .get("message", {})
+                          .get("content", "") or "").strip().lower()
+                # Robust to yes/no, but we expect exactly true/false
+                present = raw.startswith("true") or raw.startswith("yes")
+            except Exception as e:
+                logger.info(f"[OPENAI] error: {e}")
+                continue
+
+            # Streak logic (boolean only)
+            ds.consecutive_positives = (ds.consecutive_positives + 1) if present else 0
+            logger.info(f"[DETECT] '{dc.query}': present={present} "
+                        f"(streak {ds.consecutive_positives}/{dc.confirmations})")
+
+            if ds.consecutive_positives < dc.confirmations:
+                continue
+
+            # ---- Post hit & lock ----
+            ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            try:
+                (cfg.snap_dir / f"hit_{ts}.jpg").write_bytes(img)
+            except Exception:
+                pass
+
+            lat = state.latest_gps.lat if math.isfinite(state.latest_gps.lat) else 0.0
+            lng = state.latest_gps.lon if math.isfinite(state.latest_gps.lon) else 0.0
+            img_uri = "data:image/jpeg;base64," + base64.b64encode(img).decode("ascii")
+
+            try:
+                await asyncio.gather(
+                    s_srv.post(SERVER_BASE + "/api/target-location",
+                               json={"lat": float(f"{lat:.6f}"), "lng": float(f"{lng:.6f}")},
+                               headers=json_headers),
+                    s_srv.post(SERVER_BASE + "/api/target-image",
+                               json={"image": img_uri},
+                               headers=json_headers),
+                )
+            except Exception as e:
+                logger.info(f"[HIT] post failed: {e}")
+            finally:
+                ds.local_search_locked = True
+                ds.consecutive_positives = 0
+                logger.info("[DETECT] HIT posted; search locally locked until website toggles OFF/ON.")
+
+# ---------------------------
 # Main
 # ---------------------------
 def setup_logging(debug: bool) -> logging.Logger:
@@ -576,6 +770,12 @@ async def main_async():
 
     uart_tx_q: asyncio.Queue[str] = asyncio.Queue(maxsize=100)
 
+    # Ensure snapshot directory exists
+    try:
+        cfg.snap_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
     # Signals
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -592,6 +792,8 @@ async def main_async():
         (5.0, lambda: asyncio.create_task(gps_reader(state, cfg, logger))),
         (3.0, lambda: asyncio.create_task(file_logger(state, cfg, logger))),
         (1.0, lambda: asyncio.create_task(website_poller(state, uart_tx_q, cfg, logger))),
+        # NEW: visual search loop (after website_poller so config is ready)
+        (0.8, lambda: asyncio.create_task(visual_search_loop(state, cfg, logger))),
         (0.5, lambda: asyncio.create_task(web_poster(state, cfg, logger))),
         (0.5, lambda: asyncio.create_task(esp32_uart_rx(state, cfg, logger))),
         (0.5, lambda: asyncio.create_task(esp32_uart_tx(uart_tx_q, state, cfg, logger))),
@@ -602,7 +804,6 @@ async def main_async():
         if delay_before > 0:
             await asyncio.sleep(delay_before)
         tasks.append(start_fn())
-
 
     logger.info("airplane_pi started. Press Ctrl+C to stop.")
     try:
