@@ -11,6 +11,13 @@ Components:
 - CSV logger
 - Visual search loop using OpenAI API (reads JPEG from stream when available,
   falls back to still capture when stream is off — with camera-lock to avoid races)
+
+This version:
+- Stream snapshots at 2 Hz and scale snapshots so the shortest side is 768 px
+  (matches OpenAI `detail:"high"` internal resize; avoids server-side rescale).
+- Visual search prompts at 2 Hz (period_s = 0.5).
+- Uses separate files for stream snapshots vs. still captures.
+- Serializes camera access to avoid contention between ffmpeg and rpicam-still.
 """
 
 import os
@@ -79,7 +86,7 @@ class Config:
 class DetectConfig:
     enabled: bool = False
     query: str = ""
-    period_s: float = 5.0         # sample cadence
+    period_s: float = 0.5         # 2 Hz prompts
     confirmations: int = 1        # consecutive positives required
 
 @dataclass
@@ -387,6 +394,10 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
     cfg.snap_dir.mkdir(parents=True, exist_ok=True)
     snap_path = str(cfg.snap_dir / cfg.snap_stream_name)  # <-- stream snapshot file
 
+    # Snapshot branch:
+    # - 2 frames per second
+    # - scale so SHORTEST side is 768 (for 1280x720 this sets height=768, width≈1365)
+    # - overwrite same file each time
     ffmpeg_cmd = [
         "ffmpeg",
         "-hide_banner", "-loglevel", "warning",
@@ -407,9 +418,9 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
         "-c:a", "aac", "-b:a", "128k",
         "-f", "flv", "-rtmp_live", "live", f"{cfg.rtmp_url}/{cfg.rtmp_key}",
 
-        # Output #2: periodic JPEG snapshot (separate file from stills)
+        # Output #2: periodic JPEG snapshots for detector (2 Hz, shortest side = 768)
         "-map", "1:v",
-        "-vf", "fps=1/5,scale=640:-1",
+        "-vf", "fps=2,scale=-1:768",
         "-c:v", "mjpeg",
         "-q:v", "5",
         "-f", "image2",
@@ -477,7 +488,7 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
 
             running = True
             state.stream_status = "on"
-            logger.info("[STREAM] started (rpicam-vid → ffmpeg → RTMP + JPEG)")
+            logger.info("[STREAM] started (rpicam-vid → ffmpeg → RTMP + JPEG @ 2 Hz, shortest side 768)")
         except Exception as e:
             state.stream_status = "error"
             logger.info(f"[STREAM] failed to start: {e}")
@@ -696,7 +707,9 @@ async def visual_search_loop(state: RuntimeState, cfg: Config, logger: logging.L
                ClientSession(timeout=ClientTimeout(total=10)) as s_srv:
 
         while not state.shutting_down:
-            await asyncio.sleep(max(1.0, float(getattr(state.detect_cfg, "period_s", 5.0))))
+            # Allow sub-second cadence; clamp to avoid zero/negative
+            period = float(getattr(state.detect_cfg, "period_s", 0.5))
+            await asyncio.sleep(max(0.05, period))
 
             dc, ds = state.detect_cfg, state.detect_state
             if not dc.enabled:
@@ -721,7 +734,7 @@ async def visual_search_loop(state: RuntimeState, cfg: Config, logger: logging.L
                             img = snap_stream.read_bytes()
                             visual_search_loop._last_mt = cur_mt
                         else:
-                            # no new frame yet; give ffmpeg a moment
+                            # no new frame yet
                             continue
                     else:
                         # stream likely just starting; wait for first frame
@@ -743,12 +756,15 @@ async def visual_search_loop(state: RuntimeState, cfg: Config, logger: logging.L
                         # Someone is using camera; skip this cycle
                         continue
                     tmp = snap_still.with_suffix(snap_still.suffix + ".tmp")
+                    # Match the same size policy as stream snapshots (shortest side 768)
                     cmd = [
                         tool, "-n", "-t", "1",
                         "--width", str(max(cfg.cam_width, 640)),
                         "--height", str(max(cfg.cam_height, 360)),
                         "--rotation", str(cfg.cam_rotation_deg),
                         "-q", "85", "-o", str(tmp),
+                        # rpicam-still doesn't scale like ffmpeg's -vf; we keep native and let API upscale.
+                        # If you want local scaling here, swap to `libcamera-still` with `--width/--height` set to ~1365x768.
                     ]
                     pcap = await asyncio.create_subprocess_exec(
                         *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
@@ -766,7 +782,7 @@ async def visual_search_loop(state: RuntimeState, cfg: Config, logger: logging.L
             if not img:
                 continue
 
-            # ---- Ask OpenAI for strict True/False ----
+            # ---- Ask OpenAI for strict True/False (force high detail) ----
             data_uri = "data:image/jpeg;base64," + base64.b64encode(img).decode("ascii")
             body = {
                 "model": getattr(cfg, "openai_model", "gpt-4o-mini"),
@@ -777,7 +793,7 @@ async def visual_search_loop(state: RuntimeState, cfg: Config, logger: logging.L
                         {"type": "text",
                          "text": f"Does this photo contain '{dc.query}'? "
                                  "Answer strictly 'True' or 'False' with no other text."},
-                        {"type": "image_url", "image_url": {"url": data_uri}},
+                        {"type": "image_url", "image_url": {"url": data_uri, "detail": "high"}},
                     ],
                 }],
             }
