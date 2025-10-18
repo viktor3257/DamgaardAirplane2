@@ -349,6 +349,7 @@ async def website_poller(state: RuntimeState, uart_tx_q: asyncio.Queue, cfg: Con
             except Exception as e:
                 logger.info(f"[API] search-status failed: {e}")
 
+
 # ---------------------------
 # Stream manager (hardened)
 # ---------------------------
@@ -392,14 +393,22 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
     ]
 
     cfg.snap_dir.mkdir(parents=True, exist_ok=True)
-    snap_path = str(cfg.snap_dir / cfg.snap_stream_name)  # <-- stream snapshot file
+    snap_file = cfg.snap_dir / cfg.snap_stream_name
+    snap_path = str(snap_file)  # <-- stream snapshot file
+
+    # Remove any stale file so ffmpeg can overwrite cleanly even on strict builds
+    try:
+        if snap_file.exists():
+            snap_file.unlink()
+    except Exception as e:
+        logger.debug(f"[STREAM] could not delete stale snapshot: {e}")
 
     # Snapshot branch:
     # - 2 frames per second
     # - scale so SHORTEST side is 768 (for 1280x720 this sets height=768, width≈1365)
     # - overwrite same file each time
     ffmpeg_cmd = [
-        "ffmpeg",
+        "ffmpeg", "-y",                 # <-- force overwrite existing files
         "-hide_banner", "-loglevel", "warning",
 
         # input 0: silent audio (keeps YT happy)
@@ -542,6 +551,9 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
 
     finally:
         stop_pipeline()
+
+
+
 
 # ---------------------------
 # CSV logger
