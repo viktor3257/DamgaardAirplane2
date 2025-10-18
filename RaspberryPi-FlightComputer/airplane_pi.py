@@ -10,7 +10,7 @@ Components:
 - Stream state manager (RTMP + periodic JPEG snapshot for vision)
 - CSV logger
 - Visual search loop using OpenAI API (reads JPEG from stream when available,
-  falls back to still capture when stream is off)
+  falls back to still capture when stream is off — with camera-lock to avoid races)
 """
 
 import os
@@ -67,7 +67,9 @@ class Config:
 
     # Snapshots for visual search
     snap_dir: Path = BASE_DIR / "snaps"
-    snap_name: str = "snap_latest.jpg"
+    # Use distinct filenames to avoid collisions/races
+    snap_stream_name: str = "stream.jpg"  # ffmpeg -update 1 writes here
+    snap_still_name: str  = "still.jpg"   # rpicam-still writes here
 
     # OpenAI (vision)
     openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", "").strip())
@@ -129,6 +131,10 @@ class RuntimeState:
     # Visual search
     detect_cfg: DetectConfig = field(default_factory=DetectConfig)
     detect_state: DetectState = field(default_factory=DetectState)
+
+    # Camera coordination
+    camera_lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # serialize camera open
+    stream_status: str = "off"  # "off" | "starting" | "on" | "error"
 
 # ---------------------------
 # GPS (SIM7600G-H via NMEA)
@@ -337,10 +343,6 @@ async def website_poller(state: RuntimeState, uart_tx_q: asyncio.Queue, cfg: Con
                 logger.info(f"[API] search-status failed: {e}")
 
 # ---------------------------
-# Stream manager
-# ---------------------------
-
-# ---------------------------
 # Stream manager (hardened)
 # ---------------------------
 async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logger):
@@ -349,6 +351,9 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
     rpicam-vid (H.264) -> ffmpeg (copy video + AAC) -> RTMP
     and a periodic JPEG snapshot for the vision loop.
     Captures child stderr; backs off on repeated failures.
+
+    Uses a camera_lock to avoid startup races with still-capture.
+    Updates state.stream_status: "off" | "starting" | "on" | "error".
     """
     import threading
     import shutil
@@ -380,7 +385,7 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
     ]
 
     cfg.snap_dir.mkdir(parents=True, exist_ok=True)
-    snap_path = str(cfg.snap_dir / cfg.snap_name)
+    snap_path = str(cfg.snap_dir / cfg.snap_stream_name)  # <-- stream snapshot file
 
     ffmpeg_cmd = [
         "ffmpeg",
@@ -402,7 +407,7 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
         "-c:a", "aac", "-b:a", "128k",
         "-f", "flv", "-rtmp_live", "live", f"{cfg.rtmp_url}/{cfg.rtmp_key}",
 
-        # Output #2: periodic JPEG snapshot
+        # Output #2: periodic JPEG snapshot (separate file from stills)
         "-map", "1:v",
         "-vf", "fps=1/5,scale=640:-1",
         "-c:v", "mjpeg",
@@ -426,35 +431,6 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
         except Exception:
             pass
 
-    def start_pipeline():
-        nonlocal cam_proc, ffmpeg_proc, running
-        if running:
-            return
-        try:
-            cam_proc = subprocess.Popen(
-                cam_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0
-            )
-            ffmpeg_proc = subprocess.Popen(
-                ffmpeg_cmd,
-                stdin=cam_proc.stdout,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                bufsize=0
-            )
-
-            # stderr readers
-            threading.Thread(target=_pump_stderr, args=(cam_proc.stderr, "[rpicam-vid]"), daemon=True).start()
-            threading.Thread(target=_pump_stderr, args=(ffmpeg_proc.stderr, "[ffmpeg]"), daemon=True).start()
-
-            running = True
-            logger.info("[STREAM] started (rpicam-vid → ffmpeg → RTMP + JPEG)")
-        except Exception as e:
-            logger.info(f"[STREAM] failed to start: {e}")
-            stop_pipeline()
-
     def stop_pipeline():
         nonlocal cam_proc, ffmpeg_proc, running
         if not running:
@@ -475,16 +451,67 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
                 pass
         cam_proc, ffmpeg_proc = None, None
         running = False
+        state.stream_status = "off"
+
+    def start_pipeline_locked():
+        """Start child processes. Must be called with camera_lock held."""
+        nonlocal cam_proc, ffmpeg_proc, running
+        try:
+            cam_proc = subprocess.Popen(
+                cam_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0
+            )
+            ffmpeg_proc = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=cam_proc.stdout,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                bufsize=0
+            )
+
+            # stderr readers
+            threading.Thread(target=_pump_stderr, args=(cam_proc.stderr, "[rpicam-vid]"), daemon=True).start()
+            threading.Thread(target=_pump_stderr, args=(ffmpeg_proc.stderr, "[ffmpeg]"), daemon=True).start()
+
+            running = True
+            state.stream_status = "on"
+            logger.info("[STREAM] started (rpicam-vid → ffmpeg → RTMP + JPEG)")
+        except Exception as e:
+            state.stream_status = "error"
+            logger.info(f"[STREAM] failed to start: {e}")
+            stop_pipeline()
 
     try:
         while not state.shutting_down:
             await asyncio.sleep(0.25)
+
+            # start
             if state.stream_enabled and not running:
-                start_pipeline()
-                backoff_s = 1.0  # reset backoff after a clean start
+                state.stream_status = "starting"
+                # Hold the camera lock briefly while we open the camera to avoid races
+                got = False
+                try:
+                    got = await asyncio.wait_for(state.camera_lock.acquire(), timeout=1.0)
+                except Exception:
+                    got = False
+                try:
+                    if got:
+                        start_pipeline_locked()
+                    else:
+                        logger.info("[STREAM] could not acquire camera_lock; will retry soon")
+                finally:
+                    if state.camera_lock.locked():
+                        state.camera_lock.release()
+
+                backoff_s = 1.0  # reset backoff after an attempt
+
+            # stop
             elif not state.stream_enabled and running:
                 stop_pipeline()
 
+            # supervise
             if state.stream_enabled and running:
                 dead = False
                 try:
@@ -498,13 +525,12 @@ async def stream_manager(state: RuntimeState, cfg: Config, logger: logging.Logge
                 if dead:
                     logger.info(f"[STREAM] pipeline exited; restarting in {backoff_s:.1f}s")
                     stop_pipeline()
-                    # Exponential backoff up to 30s to avoid thrash if RTMP/DNS is down
                     await asyncio.sleep(backoff_s)
                     backoff_s = min(backoff_s * 2, 30.0)
-                    start_pipeline()
+                    # Try to restart on next loop iteration
+
     finally:
         stop_pipeline()
-
 
 # ---------------------------
 # CSV logger
@@ -636,8 +662,8 @@ async def web_poster(state: RuntimeState, cfg: Config, logger: logging.Logger):
 async def visual_search_loop(state: RuntimeState, cfg: Config, logger: logging.Logger):
     """
     Every detect_cfg.period_s:
-      - If stream is ON: read JPEG written by ffmpeg (no camera contention)
-      - Else: still-capture (rpicam-still/libcamera-still) if available
+      - If stream is ON/starting: read JPEG written by ffmpeg (no camera contention)
+      - Else: still-capture (rpicam-still/libcamera-still) if available (guarded by camera_lock)
       - Ask OpenAI if the image contains `detect_cfg.query` (strict True/False)
       - On `confirmations` consecutive True -> post GPS + image and lock locally
     """
@@ -654,13 +680,16 @@ async def visual_search_loop(state: RuntimeState, cfg: Config, logger: logging.L
     if not tool:
         logger.info("[DETECT] no still-capture tool found. Will use stream snapshots when available.")
 
-    # Resolve API key once
-    api_key = cfg.openai_api_key
+    # Resolve API key (cfg or env)
+    api_key = (cfg.openai_api_key or os.getenv("OPENAI_API_KEY", "")).strip()
     if not api_key:
         logger.error("[OPENAI] missing API key (OPENAI_API_KEY).")
         return
     openai_headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     json_headers   = {"Content-Type": "application/json"}
+
+    snap_stream = cfg.snap_dir / cfg.snap_stream_name  # ffmpeg writes here
+    snap_still  = cfg.snap_dir / cfg.snap_still_name   # we write here
 
     # Reuse HTTP sessions
     async with ClientSession(timeout=ClientTimeout(total=12), headers=openai_headers) as s_ai, \
@@ -677,48 +706,62 @@ async def visual_search_loop(state: RuntimeState, cfg: Config, logger: logging.L
             if ds.local_search_locked:
                 continue
 
-            # ---- Snapshot (hybrid) ----
+            # ---- Snapshot (safe hybrid) ----
             img = None
-            snap_file = cfg.snap_dir / cfg.snap_name
+            prefer_stream = (getattr(state, "stream_status", "off") in ("starting", "on")) \
+                            or getattr(state, "stream_enabled", False)
 
-            if state.stream_enabled and snap_file.exists():
-                # Read latest frame from ffmpeg only when updated
-                last_mt = getattr(visual_search_loop, "_last_mt", 0.0)
+            if prefer_stream:
+                # Only read from stream snapshot; never still-capture while stream is on/starting
                 try:
-                    cur_mt = snap_file.stat().st_mtime
-                    if cur_mt <= last_mt:
-                        continue  # no new frame yet
-                    img = snap_file.read_bytes()
-                    visual_search_loop._last_mt = cur_mt
+                    if snap_stream.exists():
+                        last_mt = getattr(visual_search_loop, "_last_mt", 0.0)
+                        cur_mt = snap_stream.stat().st_mtime
+                        if cur_mt > last_mt:
+                            img = snap_stream.read_bytes()
+                            visual_search_loop._last_mt = cur_mt
+                        else:
+                            # no new frame yet; give ffmpeg a moment
+                            continue
+                    else:
+                        # stream likely just starting; wait for first frame
+                        continue
                 except Exception as e:
                     logger.debug(f"[DETECT] stream snapshot read failed: {e}")
                     continue
             else:
-                # Fallback to direct still capture when stream is OFF (or no file yet)
+                # Stream is explicitly off -> try still-capture guarded by camera_lock
                 if not tool:
-                    # No tool available — wait for stream to provide a frame
                     continue
-                tmp = cfg.snap_dir / (cfg.snap_name + ".tmp")
-                out = cfg.snap_dir / cfg.snap_name
-                cmd = [
-                    tool, "-n", "-t", "1",
-                    "--width", str(max(cfg.cam_width, 640)),
-                    "--height", str(max(cfg.cam_height, 360)),
-                    "--rotation", str(cfg.cam_rotation_deg),
-                    "-q", "85", "-o", str(tmp),
-                ]
+                got = False
                 try:
+                    got = await asyncio.wait_for(state.camera_lock.acquire(), timeout=0.05)
+                except Exception:
+                    got = False
+                try:
+                    if not got:
+                        # Someone is using camera; skip this cycle
+                        continue
+                    tmp = snap_still.with_suffix(snap_still.suffix + ".tmp")
+                    cmd = [
+                        tool, "-n", "-t", "1",
+                        "--width", str(max(cfg.cam_width, 640)),
+                        "--height", str(max(cfg.cam_height, 360)),
+                        "--rotation", str(cfg.cam_rotation_deg),
+                        "-q", "85", "-o", str(tmp),
+                    ]
                     pcap = await asyncio.create_subprocess_exec(
                         *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
                     )
                     await asyncio.wait_for(pcap.wait(), timeout=6.0)
-                    if pcap.returncode != 0 or not tmp.exists():
-                        continue
-                    tmp.replace(out)
-                    img = out.read_bytes()
+                    if pcap.returncode == 0 and tmp.exists():
+                        tmp.replace(snap_still)
+                        img = snap_still.read_bytes()
                 except Exception as e:
                     logger.debug(f"[DETECT] still snapshot error/timeout: {e}")
-                    continue
+                finally:
+                    if state.camera_lock.locked():
+                        state.camera_lock.release()
 
             if not img:
                 continue
