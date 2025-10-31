@@ -114,11 +114,11 @@ static constexpr float kSpeedPitchKi = 0.02f;
 static constexpr float kSpeedPitchKd = 0.10f;
 
 static constexpr float kRollKp = 1.3f;
-static constexpr float kRollKi = 0.02f;
+static constexpr float kRollKi = 0.00f;
 static constexpr float kRollKd = 0.25f;
 
 static constexpr float kPitchKp = 0.9f;
-static constexpr float kPitchKi = 0.02f;
+static constexpr float kPitchKi = 0.00f;
 static constexpr float kPitchKd = 0.30f;
 
 static constexpr float kAltitudeKp = 0.05f;
