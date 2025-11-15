@@ -2,6 +2,7 @@
 #include <Adafruit_BMP280.h>
 #include <Adafruit_BNO055.h>
 #include <Wire.h>
+#include <math.h>
 #include <string.h>
 #include <stdio.h>
 #include "sensors.h"
@@ -65,13 +66,29 @@ static const unsigned long kPiGpsTimeout = 2000; // ms
 
 static char g_piBuf[128];
 static size_t g_piIdx = 0;
+static unsigned long g_lastPiTelemetrySend = 0;
+
+static float sanitizeFloat(float value, float fallback = 0.0f) {
+    if (isnan(value) || isinf(value)) {
+        return fallback;
+    }
+    return value;
+}
+
+static double sanitizeDouble(double value, double fallback = 0.0) {
+    if (isnan(value) || isinf(value)) {
+        return fallback;
+    }
+    return value;
+}
 
 static void parsePiLine(const char* line) {
     double lat = 0.0, lon = 0.0;
     double tlat = 0.0, tlon = 0.0;
     double heading = 0.0;
+    double groundspeed = 0.0;
 
-    int count = sscanf(line, "%lf,%lf,%lf,%lf,%lf", &lat, &lon, &tlat, &tlon, &heading);
+    int count = sscanf(line, "%lf,%lf,%lf,%lf,%lf,%lf", &lat, &lon, &tlat, &tlon, &heading, &groundspeed);
     if (count >= 2) {
         g_airplaneLatitude = lat;
         g_airplaneLongitude = lon;
@@ -82,6 +99,9 @@ static void parsePiLine(const char* line) {
         if (count >= 5) {
             g_airplaneHeading = heading;
         }
+        if (count >= 6) {
+            g_airplaneGroundSpeed = groundspeed;
+        }
     } else {
         const char* pLat = strstr(line, "\"lat\"");
         const char* pLng = strstr(line, "\"lng\"");
@@ -91,13 +111,16 @@ static void parsePiLine(const char* line) {
         const char* pTLng = strstr(line, "\"tlng\"");
         if (!pTLng) pTLng = strstr(line, "\"target_lng\"");
         if (!pTLng) pTLng = strstr(line, "\"target_lon\"");
-        const char* pHeading = strstr(line, "\"heading\"");
+        const char* pHeading = strstr(line, "\"heading_deg\"");
+        if (!pHeading) pHeading = strstr(line, "\"heading\"");
+        const char* pGround = strstr(line, "\"groundspeed_ms\"");
 
         if (pLat) pLat = strchr(pLat, ':');
         if (pLng) pLng = strchr(pLng, ':');
         if (pTLat) pTLat = strchr(pTLat, ':');
         if (pTLng) pTLng = strchr(pTLng, ':');
         if (pHeading) pHeading = strchr(pHeading, ':');
+        if (pGround) pGround = strchr(pGround, ':');
 
         if (pLat && pLng) {
             lat = atof(pLat + 1);
@@ -114,6 +137,10 @@ static void parsePiLine(const char* line) {
         if (pHeading) {
             heading = atof(pHeading + 1);
             g_airplaneHeading = heading;
+        }
+        if (pGround) {
+            groundspeed = atof(pGround + 1);
+            g_airplaneGroundSpeed = groundspeed;
         }
     }
 
@@ -141,6 +168,53 @@ static void readPiGps() {
             g_airplaneReceivesDataFromRaspberryPi = false;
             g_lastPiGpsTime = 0;
         }
+    }
+}
+
+static void sendTelemetryToPi() {
+    static const unsigned long kTelemetryIntervalMs = 200;
+    unsigned long now = millis();
+    if (now - g_lastPiTelemetrySend < kTelemetryIntervalMs) {
+        return;
+    }
+    g_lastPiTelemetrySend = now;
+
+    char line[192];
+    float batteryPct = constrain(sanitizeFloat(g_airplaneBatteryPercent), 0.0f, 100.0f);
+    float airspeed = sanitizeFloat(g_airplaneAirSpeed);
+    float groundspeed = sanitizeFloat(g_airplaneGroundSpeed);
+    float pitch = sanitizeFloat(g_airplanePitch);
+    float roll = sanitizeFloat(g_airplaneRoll);
+    float height = sanitizeFloat(g_airplaneHeight);
+    float current = sanitizeFloat(g_airplaneCurrentA);
+    float currentV = sanitizeFloat(g_airplaneCurrentSensorV);
+    double lat = sanitizeDouble(g_airplaneLatitude);
+    double lon = sanitizeDouble(g_airplaneLongitude);
+    double heading = sanitizeDouble(g_airplaneHeading);
+
+    int len = snprintf(
+        line,
+        sizeof(line),
+        "{\"type\":\"telemetry\",\"mode\":%u,\"battery_pct\":%.1f,\"height_m\":%.2f,"
+        "\"airspeed_ms\":%.2f,\"groundspeed_ms\":%.2f,\"pitch_deg\":%.2f,\"roll_deg\":%.2f,"
+        "\"current_a\":%.2f,\"current_sensor_v\":%.3f,\"lat\":%.6f,\"lon\":%.6f,"
+        "\"heading_deg\":%.2f,\"timestamp\":%.3f}\n",
+        static_cast<unsigned int>(g_airplaneMode),
+        batteryPct,
+        height,
+        airspeed,
+        groundspeed,
+        pitch,
+        roll,
+        current,
+        currentV,
+        lat,
+        lon,
+        heading,
+        static_cast<float>(now) / 1000.0f);
+
+    if (len > 0) {
+        Serial2.write(reinterpret_cast<const uint8_t*>(line), static_cast<size_t>(len));
     }
 }
 
@@ -293,4 +367,5 @@ void readSensors() {
     readBMP280();
     readAirspeed();
     readBattery();
+    sendTelemetryToPi();
 }

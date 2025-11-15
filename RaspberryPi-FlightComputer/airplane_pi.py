@@ -4,7 +4,7 @@ airplane_pi.py — async process for Raspberry Pi.
 
 Components:
 - GPS reader (SIM7600G-H NMEA → lat/lon, heading, ground speed)
-- ESP32 telemetry simulator (until real UART is wired)
+- ESP32 UART link (bi-directional nav + telemetry)
 - Web poster (POSTs location/telemetry to your API)
 - Website poller (stream-state, circling-point, search-status)
 - Stream state manager (RTMP + periodic JPEG snapshot for vision)
@@ -18,6 +18,7 @@ This version:
 - Visual search prompts at 2 Hz (period_s = 0.5).
 - Uses separate files for stream snapshots vs. still captures.
 - Serializes camera access to avoid contention between ffmpeg and rpicam-still.
+- Streams JSON telemetry to/from ESP32 over UART with auto-reconnect.
 """
 
 import os
@@ -36,7 +37,7 @@ import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 # ---------------------------
 # Configuration
@@ -126,6 +127,8 @@ class Telemetry:
     alt_m: float = math.nan
     mode: int = 1                 # 1=Neutral, 2=Manual, 3=Circling (from ESP32)
     battery_pct: float = math.nan # 0..100 (from ESP32)
+    current_a: float = math.nan
+    current_sensor_v: float = math.nan
 
 @dataclass
 class RuntimeState:
@@ -142,6 +145,233 @@ class RuntimeState:
     # Camera coordination
     camera_lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # serialize camera open
     stream_status: str = "off"  # "off" | "starting" | "on" | "error"
+
+# ---------------------------
+# ESP32 UART helper
+# ---------------------------
+class Esp32SerialLink:
+    """Shared UART connection with automatic reconnect."""
+
+    def __init__(self, state: RuntimeState, cfg: Config, logger: logging.Logger):
+        self._state = state
+        self._cfg = cfg
+        self._logger = logger
+        self._serial = None
+        self._lock = asyncio.Lock()
+
+    async def get_serial(self):
+        import serial  # local import to keep dependency scoped
+
+        while not self._state.shutting_down:
+            if self._serial and self._serial.is_open:
+                return self._serial
+
+            async with self._lock:
+                if self._serial and self._serial.is_open:
+                    return self._serial
+                try:
+                    ser = serial.Serial(
+                        self._cfg.uart_dev,
+                        self._cfg.uart_baud,
+                        timeout=0,
+                        write_timeout=1.0,
+                    )
+                    ser.reset_input_buffer()
+                    ser.reset_output_buffer()
+                    self._serial = ser
+                    self._logger.info(
+                        f"[UART] Connected to {self._cfg.uart_dev} @ {self._cfg.uart_baud}"
+                    )
+                    return self._serial
+                except Exception as e:
+                    self._logger.info(
+                        f"[UART] open {self._cfg.uart_dev} failed: {e}; retrying in 2 s"
+                    )
+                    await asyncio.sleep(2.0)
+
+        raise RuntimeError("Shutting down")
+
+    def drop_connection(self):
+        ser = self._serial
+        self._serial = None
+        if ser:
+            try:
+                ser.close()
+            except Exception:
+                pass
+
+
+class Esp32UartBridge:
+    """Encapsulates UART RX/TX flows for the ESP32 link."""
+
+    def __init__(
+        self,
+        state: RuntimeState,
+        cfg: Config,
+        link: Esp32SerialLink,
+        logger: logging.Logger,
+    ) -> None:
+        self._state = state
+        self._cfg = cfg
+        self._link = link
+        self._logger = logger
+        self._buffer = bytearray()
+        self._send_period = 0.2
+        self._last_send = 0.0
+        self._send_event = asyncio.Event()
+
+    def request_nav_send(self) -> None:
+        """Schedule an immediate nav payload transmission."""
+        self._send_event.set()
+
+    def _finite_or_none(self, value: Optional[float]) -> Optional[float]:
+        if isinstance(value, (int, float)) and math.isfinite(value):
+            return float(value)
+        return None
+
+    def _build_nav_payload(self) -> Dict[str, Any]:
+        target_lat = target_lon = None
+        if self._state.target_points:
+            target_lat = self._state.target_points[0].lat
+            target_lon = self._state.target_points[0].lon
+
+        payload: Dict[str, Any] = {
+            "type": "nav",
+            "timestamp": time.time(),
+        }
+
+        for key, value in (
+            ("lat", self._finite_or_none(self._state.latest_gps.lat)),
+            ("lon", self._finite_or_none(self._state.latest_gps.lon)),
+            ("target_lat", self._finite_or_none(target_lat)),
+            ("target_lon", self._finite_or_none(target_lon)),
+            ("heading_deg", self._finite_or_none(self._state.latest_esp32.yaw_deg)),
+            (
+                "groundspeed_ms",
+                self._finite_or_none(self._state.latest_esp32.groundspeed_ms),
+            ),
+        ):
+            if value is not None:
+                payload[key] = value
+
+        return payload
+
+    def _apply_telemetry(self, doc: Dict[str, Any]) -> None:
+        tel = self._state.latest_esp32
+        now = time.time()
+        tel.time_utc = now
+
+        if "mode" in doc:
+            try:
+                tel.mode = int(doc["mode"])
+            except Exception:
+                pass
+
+        for key, attr in (
+            ("battery_pct", "battery_pct"),
+            ("battery_v", "batt_v"),
+            ("airspeed_ms", "airspeed_ms"),
+            ("groundspeed_ms", "groundspeed_ms"),
+            ("pitch_deg", "pitch_deg"),
+            ("roll_deg", "roll_deg"),
+            ("heading_deg", "yaw_deg"),
+            ("height_m", "alt_m"),
+            ("lat", "lat"),
+            ("lon", "lon"),
+        ):
+            val = doc.get(key)
+            if isinstance(val, (int, float)) and math.isfinite(val):
+                setattr(tel, attr, float(val))
+
+        if isinstance(doc.get("current_a"), (int, float)):
+            tel.current_a = float(doc["current_a"])
+        if isinstance(doc.get("current_sensor_v"), (int, float)):
+            tel.current_sensor_v = float(doc["current_sensor_v"])
+
+        self._state.latest_esp32 = tel
+
+    async def run_rx(self) -> None:
+        """Consume telemetry frames emitted by the ESP32."""
+
+        while not self._state.shutting_down:
+            try:
+                ser = await self._link.get_serial()
+            except RuntimeError:
+                break
+
+            try:
+                data = ser.read(ser.in_waiting or 128)
+            except Exception as e:
+                self._logger.info(f"[UART<-ESP32] read error: {e}")
+                self._link.drop_connection()
+                await asyncio.sleep(0.5)
+                continue
+
+            if not data:
+                await asyncio.sleep(0.05)
+                continue
+
+            self._buffer.extend(data)
+            while b"\n" in self._buffer:
+                line, _, remainder = self._buffer.partition(b"\n")
+                self._buffer = bytearray(remainder)
+                text = line.strip().decode(errors="ignore")
+                if not text:
+                    continue
+                try:
+                    doc = json.loads(text)
+                except json.JSONDecodeError:
+                    self._logger.debug(
+                        f"[UART<-ESP32] ignoring non-JSON line: {text}"
+                    )
+                    continue
+
+                if isinstance(doc, dict):
+                    self._apply_telemetry(doc)
+
+    async def run_tx(self) -> None:
+        """Stream navigation data (GPS + targets) to the ESP32."""
+
+        while not self._state.shutting_down:
+            try:
+                ser = await self._link.get_serial()
+            except RuntimeError:
+                break
+
+            wait_time = max(0.0, self._send_period - (time.time() - self._last_send))
+            if wait_time > 0:
+                try:
+                    await asyncio.wait_for(self._send_event.wait(), timeout=wait_time)
+                except asyncio.TimeoutError:
+                    pass
+
+            triggered = self._send_event.is_set()
+            if triggered:
+                self._send_event.clear()
+
+            if (time.time() - self._last_send) < self._send_period and not triggered:
+                continue
+
+            payload = self._build_nav_payload()
+
+            try:
+                encoded = json.dumps(payload, separators=(",", ":"), allow_nan=False) + "\n"
+            except (TypeError, ValueError):
+                self._logger.debug(
+                    "[UART->ESP32] nav payload had non-serializable values; skipping"
+                )
+                self._last_send = time.time()
+                continue
+
+            try:
+                ser.write(encoded.encode("utf-8"))
+                ser.flush()
+                self._last_send = time.time()
+            except Exception as e:
+                self._logger.info(f"[UART->ESP32] write error: {e}")
+                self._link.drop_connection()
+                await asyncio.sleep(0.5)
+
 
 # ---------------------------
 # GPS (SIM7600G-H via NMEA)
@@ -240,48 +470,18 @@ async def gps_reader(state: RuntimeState, cfg: Config, logger: logging.Logger):
     logger.info("[SIM7600] NMEA reader stopped")
 
 # ---------------------------
-# ESP32 telemetry (simulated)
-# ---------------------------
-async def esp32_uart_rx(state: RuntimeState, cfg: Config, logger: logging.Logger):
-    t0 = time.time()
-    while not state.shutting_down:
-        await asyncio.sleep(0.05)
-        t = time.time() - t0
-        mode_sim = [1, 2, 3][int(t // 10) % 3]  # cycles every 10s
-        pct_sim  = 80 + 15 * math.sin(t / 30)   # ~65..95%
-        state.latest_esp32 = Telemetry(
-            time_utc=time.time(),
-            batt_v=11.1 + 0.2 * math.sin(t / 10),
-            airspeed_ms=10 + 2 * math.sin(t),
-            groundspeed_ms=state.latest_esp32.groundspeed_ms,  # updated by GPS task
-            roll_deg=10 * math.sin(t * 0.7),
-            pitch_deg=5 * math.sin(t * 0.5),
-            yaw_deg=state.latest_esp32.yaw_deg,                # updated by GPS task
-            lat=state.latest_gps.lat,
-            lon=state.latest_gps.lon,
-            alt_m=state.latest_gps.alt_m,
-            mode=mode_sim,
-            battery_pct=max(0, min(100, pct_sim)),
-        )
-
-async def esp32_uart_tx(uart_tx_q: asyncio.Queue, state: RuntimeState, cfg: Config, logger: logging.Logger):
-    """Send commands to ESP32 (simulated: print)."""
-    while not state.shutting_down:
-        try:
-            msg = await asyncio.wait_for(uart_tx_q.get(), timeout=0.5)
-        except asyncio.TimeoutError:
-            continue
-        logger.info(f"[UART->ESP32] {msg}")
-        uart_tx_q.task_done()
-
-# ---------------------------
 # Website poller
 # ---------------------------
-async def website_poller(state: RuntimeState, uart_tx_q: asyncio.Queue, cfg: Config, logger: logging.Logger):
+async def website_poller(
+    state: RuntimeState,
+    uart_bridge: Esp32UartBridge,
+    cfg: Config,
+    logger: logging.Logger,
+):
     """
     Poll every cfg.poll_period_s:
       - GET /api/stream-state -> update stream_enabled
-      - GET /api/circling-point -> set target_points and send a TARGETS:lat,lon line on change
+      - GET /api/circling-point -> set target_points and trigger a UART nav update on change
       - GET /api/search-status -> update visual search config (enabled/query)
     """
     base = "https://studio--sky-pointer.us-central1.hosted.app"
@@ -317,7 +517,7 @@ async def website_poller(state: RuntimeState, uart_tx_q: asyncio.Queue, cfg: Con
                         state.target_points = [LatLon(float(lat), float(lng))]
                         key = (float(lat), float(lng))
                         if key != last_sent_point:
-                            await uart_tx_q.put(f"TARGETS:{lat:.6f},{lng:.6f}")
+                            uart_bridge.request_nav_send()
                             last_sent_point = key
                             logger.info(f"[API] circling point -> {lat:.6f},{lng:.6f}")
                 elif resp.status == 404:
@@ -876,7 +1076,8 @@ async def main_async():
     logger = setup_logging(cfg.debug)
     state = RuntimeState()
 
-    uart_tx_q: asyncio.Queue[str] = asyncio.Queue(maxsize=100)
+    esp32_link = Esp32SerialLink(state, cfg, logger)
+    esp32_bridge = Esp32UartBridge(state, cfg, esp32_link, logger)
 
     # Ensure snapshot directory exists
     try:
@@ -899,11 +1100,11 @@ async def main_async():
     startup_steps = [
         (5.0, lambda: asyncio.create_task(gps_reader(state, cfg, logger))),
         (3.0, lambda: asyncio.create_task(file_logger(state, cfg, logger))),
-        (1.0, lambda: asyncio.create_task(website_poller(state, uart_tx_q, cfg, logger))),
+        (1.0, lambda: asyncio.create_task(website_poller(state, esp32_bridge, cfg, logger))),
         (0.8, lambda: asyncio.create_task(visual_search_loop(state, cfg, logger))),  # after poller
         (0.5, lambda: asyncio.create_task(web_poster(state, cfg, logger))),
-        (0.5, lambda: asyncio.create_task(esp32_uart_rx(state, cfg, logger))),
-        (0.5, lambda: asyncio.create_task(esp32_uart_tx(uart_tx_q, state, cfg, logger))),
+        (0.5, lambda: asyncio.create_task(esp32_bridge.run_rx())),
+        (0.5, lambda: asyncio.create_task(esp32_bridge.run_tx())),
         (0.5, lambda: asyncio.create_task(stream_manager(state, cfg, logger))),
     ]
 
