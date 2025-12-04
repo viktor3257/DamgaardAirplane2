@@ -168,11 +168,18 @@ static bool sendTelemetryPacket() {
 }
 
 static void handleRx() {
+  size_t len = radio.getPacketLength();
+  if (len == 0) {
+    beginRx();
+    return;
+  }
+
   uint8_t buffer[32] = {0};
-  size_t len = sizeof(buffer);
+  if (len > sizeof(buffer)) len = sizeof(buffer);
+
   int16_t st = radio.readData(buffer, len);
   beginRx();
-  if (st != RADIOLIB_ERR_NONE || len < 1) return;
+  if (st != RADIOLIB_ERR_NONE) return;
 
   if (len >= sizeof(ControlPacket)) {
     const ControlPacket *pkt = reinterpret_cast<const ControlPacket*>(buffer);

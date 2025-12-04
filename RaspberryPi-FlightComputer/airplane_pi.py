@@ -64,9 +64,12 @@ class Config:
     # Logging verbosity
     debug: bool = True
 
+    # API
+    api_base: str = field(default_factory=lambda: os.getenv("AIRPLANE_API_BASE", "https://studio--sky-pointer.us-central1.hosted.app").rstrip("/"))
+
     # Streaming
     rtmp_url: str = "rtmp://a.rtmp.youtube.com/live2"
-    rtmp_key: str = "bq45-5jky-84s0-cy0y-e8uy"
+    rtmp_key: str = field(default_factory=lambda: os.getenv("AIRPLANE_RTMP_KEY", "bq45-5jky-84s0-cy0y-e8uy"))
     cam_width: int = 1280
     cam_height: int = 720
     cam_fps: int = 30
@@ -484,7 +487,6 @@ async def website_poller(
       - GET /api/circling-point -> set target_points and trigger a UART nav update on change
       - GET /api/search-status -> update visual search config (enabled/query)
     """
-    base = "https://studio--sky-pointer.us-central1.hosted.app"
     period = cfg.poll_period_s
     last_sent_point = None  # (lat, lon)
 
@@ -494,7 +496,7 @@ async def website_poller(
 
             # stream-state
             try:
-                resp = await session.get(base + "/api/stream-state")
+                resp = await session.get(cfg.api_base + "/api/stream-state")
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
                     is_on = bool(data.get("isOn"))
@@ -508,7 +510,7 @@ async def website_poller(
 
             # circling-point
             try:
-                resp = await session.get(base + "/api/circling-point")
+                resp = await session.get(cfg.api_base + "/api/circling-point")
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
                     lat = data.get("lat")
@@ -529,7 +531,7 @@ async def website_poller(
 
             # object search status
             try:
-                resp = await session.get(base + "/api/search-status")
+                resp = await session.get(cfg.api_base + "/api/search-status")
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
                     is_searching = bool(data.get("isSearching", False))
@@ -845,7 +847,7 @@ async def file_logger(state: RuntimeState, cfg: Config, logger: logging.Logger):
 # Web poster (telemetry)
 # ---------------------------
 async def web_poster(state: RuntimeState, cfg: Config, logger: logging.Logger):
-    url = "https://studio--sky-pointer.us-central1.hosted.app/api/drone-location"
+    url = cfg.api_base + "/api/drone-location"
     period = 1.0 / max(cfg.post_rate_hz, 1.0)
     headers = {"Content-Type": "application/json"}
 
@@ -896,7 +898,6 @@ async def visual_search_loop(state: RuntimeState, cfg: Config, logger: logging.L
     cfg.snap_dir.mkdir(parents=True, exist_ok=True)
 
     OPENAI_URL  = "https://api.openai.com/v1/chat/completions"
-    SERVER_BASE = "https://studio--sky-pointer.us-central1.hosted.app"
 
     # Still-capture tool is optional (only required when stream is OFF)
     tool = shutil.which("rpicam-still") or shutil.which("libcamera-still")
@@ -1045,10 +1046,10 @@ async def visual_search_loop(state: RuntimeState, cfg: Config, logger: logging.L
 
             try:
                 await asyncio.gather(
-                    s_srv.post(SERVER_BASE + "/api/target-location",
+                    s_srv.post(cfg.api_base + "/api/target-location",
                                json={"lat": float(f"{lat:.6f}"), "lng": float(f"{lng:.6f}")},
                                headers=json_headers),
-                    s_srv.post(SERVER_BASE + "/api/target-image",
+                    s_srv.post(cfg.api_base + "/api/target-image",
                                json={"image": img_uri},
                                headers=json_headers),
                 )
